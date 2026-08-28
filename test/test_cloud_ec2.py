@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 import pytest
 
@@ -72,12 +73,10 @@ class TestSubTemplateSyntax:
         )
         # And the banner is excluded anyway: the log APPENDS across re-runs of
         # the unit, so a previous attempt's banner can still be the last match.
-        assert "grep -av 'BOOTSTRAP FAILED'" in text, (
-            "a prior attempt's banner lingers in the appended log; exclude it"
-        )
-        reason = next(
-            line for line in text.splitlines() if line.strip().startswith('reason="')
-        )
+        assert (
+            "grep -av 'BOOTSTRAP FAILED'" in text
+        ), "a prior attempt's banner lingers in the appended log; exclude it"
+        reason = next(line for line in text.splitlines() if line.strip().startswith('reason="'))
         assert "err1" in reason and "tail_ctx" in reason, reason
         assert reason.index("err1") < reason.index("tail_ctx"), (
             "the error line must precede the log tail in the reason, or a "
@@ -93,17 +92,15 @@ class TestSubTemplateSyntax:
         # that will not resolve is a network fault -- calling it "did not install"
         # points the reader at permissions and glibc/musl instead of at DNS.
         text = ec2.load_template()
-        assert 'fail "could not DOWNLOAD kiro-cli from $KIRO_URL' in text, (
-            "the download must fail with its own message naming the URL"
-        )
+        assert (
+            'fail "could not DOWNLOAD kiro-cli from $KIRO_URL' in text
+        ), "the download must fail with its own message naming the URL"
         # The install keeps its deliberately tolerant path plus the binary check,
         # so a genuine install failure is still reported as an install failure.
         assert "install returned nonzero" in text
         assert 'fail "kiro-cli did not install' in text
         # And the download must be judged BEFORE the install runs.
-        assert text.index("could not DOWNLOAD kiro-cli") < text.index(
-            "install returned nonzero"
-        )
+        assert text.index("could not DOWNLOAD kiro-cli") < text.index("install returned nonzero")
 
     def test_source_fetch_failure_is_not_asserted_to_be_an_install_failure(self):
         # kcfetch.sh runs under `set -e`, so a failing `aws s3 cp`, `git clone`
@@ -115,9 +112,9 @@ class TestSubTemplateSyntax:
         # step it cannot know.
         text = ec2.load_template()
         assert 'fail "kirocrew source fetch or install failed"' in text
-        assert 'fail "kirocrew install.sh failed"' not in text, (
-            "this message asserts the install step for what may be a fetch fault"
-        )
+        assert (
+            'fail "kirocrew install.sh failed"' not in text
+        ), "this message asserts the install step for what may be a fetch fault"
 
 
 class TestValidation:
@@ -234,7 +231,22 @@ class TestTemplate:
         assert "KIROCREW_AGENTCORE_WORKLOAD_NAME" in text
         assert "KIROCREW_AGENTCORE_GATEWAY_URL" in text
         assert "AgentCoreGatewayUrl:" in text
-        assert "install.sh --voice $AC_EXTRA" in text
+        # userinfo credentials must not survive CloudFormation validation.
+        gw_pat = re.search(
+            r"AgentCoreGatewayUrl:.*?AllowedPattern: \"([^\"]+)\"",
+            text,
+            re.S,
+        )
+        assert gw_pat is not None
+        assert "@" not in gw_pat.group(1)
+        # systemd treats % as specifiers; !Sub expands the URL first, then
+        # sed doubles % so Environment= keeps a percent-encoded path intact.
+        assert "AC_GW_ESC=$(printf '%s' '${AgentCoreGatewayUrl}' | sed 's/%/%%/g')" in text
+        assert "Environment=KIROCREW_AGENTCORE_GATEWAY_URL=$AC_GW_ESC" in text
+        assert "Environment=KIROCREW_AGENTCORE_GATEWAY_URL=${AgentCoreGatewayUrl}" not in text
+        # Unquoted <<KCFETCH + set -u: $AC_EXTRA must be escaped so the
+        # outer bootstrap does not expand an unbound var at write time.
+        assert text.count("install.sh --voice \\$AC_EXTRA") == 2
         assert "CrewWorkloadIdentity:" in text
         assert "AgentCoreWorkloadInstancePolicy:" in text
         assert "AgentCoreLoginInstancePolicy:" in text
@@ -300,6 +312,7 @@ class TestTemplate:
             "KirocrewRef",
             "AllowSshCidr",
             "AgentCoreWorkloadName",
+            "AgentCoreGatewayUrl",
         ):
             block = _re.search(rf"  {param}:\n(?:    .+\n)+", text)
             assert block, f"parameter {param} missing"
@@ -767,7 +780,15 @@ class TestDeployShipsSource:
         captured = {}
 
         def fake_run(argv, profile="", region="", *, timeout=ec2._DEPLOY_TIMEOUT, proc_sink=None):
+            if "--template-file" not in argv:
+                return (0, "ok", "")  # some other aws call on the way to the deploy
             captured["argv"] = argv
+            # The deployment child is the ONE reader of the staged base variant:
+            # it exists, is the stripped template, and lives under run/.
+            tpl = Path(argv[argv.index("--template-file") + 1])
+            captured["template_existed"] = tpl.exists()
+            captured["template_text"] = tpl.read_text(encoding="utf-8")
+            captured["template_path"] = tpl
             return (0, "ok", "")
 
         monkeypatch.setattr(aws, "run_aws", fake_run)
@@ -777,6 +798,10 @@ class TestDeployShipsSource:
             lambda *a, **k: {"instance_id": "i-1", "stack_status": "CREATE_COMPLETE"},
         )
         r = ec2.deploy(tag="t1", tier=sizes.default_tier(), profile="dev", region="us-east-1")
+        assert captured["template_existed"] is True
+        assert "Type: AWS::BedrockAgentCore::" not in captured["template_text"]
+        assert captured["template_path"].parent.parent.name == "run"
+        assert not captured["template_path"].exists()  # staged for the child only
         assert "SourceBucket=kirocrew-src-1-us-east-1" in captured["argv"]
         # IGW-routed subnet -> the public IP is required for egress
         assert "AssociatePublicIp=true" in captured["argv"]
@@ -998,9 +1023,7 @@ class TestDnsPreflight:
 
         monkeypatch.setattr(aws, "checked_json", fake_json)
         hits = ec2.shadowed_download_hosts("vpc-1", "dev", "us-east-1")
-        assert hits == [
-            ("desktop-release.q.us-east-1.amazonaws.com", "q.us-east-1.amazonaws.com")
-        ]
+        assert hits == [("desktop-release.q.us-east-1.amazonaws.com", "q.us-east-1.amazonaws.com")]
 
     def test_clean_vpc_has_no_hits(self, monkeypatch):
         def fake_json(args, profile="", region="", *, action, timeout=aws.DEFAULT_TIMEOUT):

@@ -66,10 +66,8 @@ class FakeEngine:
         if self.preflight_exc:
             raise self.preflight_exc
 
-    def provision(
-        self, *, tag, size_key, profile, region, agentcore_posture="none", agentcore_gateway_url=""
-    ):
-        self.calls.append(("provision", tag, size_key, agentcore_posture, agentcore_gateway_url))
+    def provision(self, *, tag, size_key, profile, region):
+        self.calls.append(("provision", tag, size_key))
         if self.provision_exc:
             raise self.provision_exc
         return "i-0abc123456789def0"
@@ -98,38 +96,12 @@ class TestStoreDurability:
         loaded = s2.get(job.id)
         assert loaded is not None
         assert loaded.size_key == "balanced"
-        assert loaded.agentcore_posture == "none"
         assert [st.key for st in loaded.steps] == [
             lj.STEP_PREFLIGHT,
             lj.STEP_PROVISION,
             lj.STEP_SIGNIN,
             lj.STEP_CONNECT,
         ]
-
-    def test_create_persists_agentcore_posture(self, tmp_path):
-        s1 = _store(tmp_path)
-        job = s1.create(
-            profile="dev",
-            region="us-east-1",
-            size_key="balanced",
-            agentcore_posture="workload",
-        )
-        loaded = lj.LaunchJobStore(root=s1.root).get(job.id)
-        assert loaded is not None
-        assert loaded.agentcore_posture == "workload"
-
-    def test_create_persists_agentcore_gateway_url(self, tmp_path):
-        s1 = _store(tmp_path)
-        job = s1.create(
-            profile="dev",
-            region="us-east-1",
-            size_key="balanced",
-            agentcore_posture="workload",
-            agentcore_gateway_url="https://gw.example.test/mcp",
-        )
-        loaded = lj.LaunchJobStore(root=s1.root).get(job.id)
-        assert loaded is not None
-        assert loaded.agentcore_gateway_url == "https://gw.example.test/mcp"
 
     def test_create_rejects_unknown_size(self, tmp_path):
         with pytest.raises(KeyError):
@@ -711,7 +683,9 @@ class TestProvisionerOnTheJob:
         """Another provisioner's ``size_key`` is its own vocabulary; refusing it here
         against ``sizes.py`` would refuse every non-EC2 launch."""
         job = _store(tmp_path).create(
-            profile="", region="us-west-2", size_key="dev.standard1.large",
+            profile="",
+            region="us-west-2",
+            size_key="dev.standard1.large",
             provider_id="devspace",
         )
         assert job.provider_id == "devspace"
@@ -719,14 +693,20 @@ class TestProvisionerOnTheJob:
 
     def test_step_labels_override_only_known_keys(self, tmp_path):
         job = _store(tmp_path).create(
-            profile="", region="", size_key="s", provider_id="devspace",
+            profile="",
+            region="",
+            size_key="s",
+            provider_id="devspace",
             step_labels={lj.STEP_PROVISION: "Create the DevSpace", "bogus": "ignored"},
         )
         labels = {st.key: st.label for st in job.steps}
         assert labels[lj.STEP_PROVISION] == "Create the DevSpace"
         assert labels[lj.STEP_PREFLIGHT] == "Check your AWS setup"  # untouched core label
         assert [st.key for st in job.steps] == [
-            lj.STEP_PREFLIGHT, lj.STEP_PROVISION, lj.STEP_SIGNIN, lj.STEP_CONNECT,
+            lj.STEP_PREFLIGHT,
+            lj.STEP_PROVISION,
+            lj.STEP_SIGNIN,
+            lj.STEP_CONNECT,
         ]
 
     def test_default_steps_with_no_overrides_are_the_core_labels(self):

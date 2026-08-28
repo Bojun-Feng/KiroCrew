@@ -106,16 +106,7 @@ class RealLaunchEngine:
             detail = reach.get("detail") or reach.get("note") or "AWS credentials did not resolve"
             raise AWSError(str(detail))
 
-    def provision(
-        self,
-        *,
-        tag: str,
-        size_key: str,
-        profile: str,
-        region: str,
-        agentcore_posture: str = "none",
-        agentcore_gateway_url: str = "",
-    ) -> str:
+    def provision(self, *, tag: str, size_key: str, profile: str, region: str) -> str:
         tier = sizes.get_tier(size_key)
         # No dashboard_port override: the stack binds its own DashboardPort
         # default. A crew once needed a bespoke port here because the tunnel
@@ -127,8 +118,6 @@ class RealLaunchEngine:
             tier=tier,
             profile=profile,
             region=region,
-            agentcore_posture=agentcore_posture,
-            agentcore_gateway_url=agentcore_gateway_url,
         )
         return result.instance_id
 
