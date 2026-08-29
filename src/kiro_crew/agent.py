@@ -1259,30 +1259,73 @@ def managed_mcp_spec_entry(name: str) -> dict[str, Any] | None:
     return entry
 
 
+def _is_agentcore_gateway_entry(spec: Any) -> bool:
+    """True for an MCP entry that reaches an AgentCore Gateway URL, under ANY name.
+
+    Delegates to :func:`platform.governance.is_agentcore_gateway_entry`, the one
+    predicate the final-map pass (``strip_ungoverned_auto_approve``) also uses,
+    so the early withhold here and the last pass every writer runs agree. A
+    co-present ``command`` does not exempt an entry: the question is what the
+    entry REACHES, and a Gateway ``url`` (with or without headers) is the shape
+    a session inject has -- on disk it can only be the operator's authoring.
+    """
+    from kiro_crew.platform.governance import is_agentcore_gateway_entry
+
+    return is_agentcore_gateway_entry(spec)
+
+
 def _merge_edition_mcp(mcp: dict[str, Any]) -> None:
-    """Merge edition extras + the AgentCore Gateway rebuild contribution.
+    """Merge edition extras and keep the reserved Gateway name session-only.
 
     Extras are ADD-only (setdefault) after secret keys are stripped so a
     companion ``Authorization`` header cannot land in kirocrew.json. The
-    Gateway server itself is ours: workload posture assigns a URL-only spec;
-    any other posture retracts a leftover entry. Login withhold of other
-    remotes is a later PR.
+    Gateway is session-injected, never written into the agent file, so a
+    profile that disabled AgentCore cannot inherit it from ``--agent``.
+
+    That guarantee has to hold for the operator's authoring too. ``mcp`` is
+    the GENERATED agent config, assembled from the shipped defaults and the
+    operator's override file: an AgentCore Gateway URL entry -- under the
+    reserved name or ANY other -- can only have come from that override (or
+    an edition extra). Emitting it would mount an unsigned Gateway remote in
+    every session that loads the agent, including the ones whose governance
+    profile denies AgentCore -- the bypass the session inject exists to
+    prevent -- and would persist whatever bearer headers it carried. So every
+    such entry is WITHHELD from the generated file (the operator's own file
+    is not modified; a warning names each entry), and the Gateway reaches a
+    session only through the governed inject. Other remotes and command
+    servers are untouched.
+    Login withhold of other remotes is a later PR.
     """
     from kiro_crew.platform.agentcore_gateway import (
         GATEWAY_SERVER_NAME,
-        rebuild_gateway_contribution,
         strip_secret_spec_keys,
     )
 
     for name, spec in _extra_mcp_servers().items():
-        if name == GATEWAY_SERVER_NAME or not isinstance(spec, dict):
+        if (
+            name == GATEWAY_SERVER_NAME
+            or not isinstance(spec, dict)
+            or _is_agentcore_gateway_entry(spec)
+        ):
             continue
         mcp.setdefault(name, strip_secret_spec_keys(spec))
-    contribution = rebuild_gateway_contribution()
-    if GATEWAY_SERVER_NAME in contribution:
-        mcp[GATEWAY_SERVER_NAME] = contribution[GATEWAY_SERVER_NAME]
-    else:
+    if mcp.get(GATEWAY_SERVER_NAME) is None:
         mcp.pop(GATEWAY_SERVER_NAME, None)
+    withheld = sorted(name for name, spec in mcp.items() if _is_agentcore_gateway_entry(spec))
+    for name in withheld:
+        mcp.pop(name, None)
+    if withheld:
+        logger.warning(
+            "%s: %d MCP server entr%s pointing at an AgentCore Gateway (%s) %s not written "
+            "to the generated agent config; the Gateway is attached per session by the "
+            "identity posture (Settings > Security > Agent identity), never as a plain "
+            "remote server.",
+            _user_overrides_path(),
+            len(withheld),
+            "y" if len(withheld) == 1 else "ies",
+            ", ".join(withheld),
+            "is" if len(withheld) == 1 else "are",
+        )
 
 
 def _extra_mcp_scope_globals() -> list[Path]:

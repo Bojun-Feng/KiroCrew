@@ -13,9 +13,14 @@ import when the extra is not installed.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import hmac
 import http.client
 import logging
 import os
+import re
+import secrets
+import socket
 import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,7 +39,35 @@ PROXY_PREFERRED_PORT = 18765
 PROXY_PORT_ENV = "KIROCREW_AGENTCORE_PROXY_PORT"
 PROXY_BODY_MAX_BYTES = 16 * 1024 * 1024
 PROXY_SOCKET_TIMEOUT_SECS = 300.0
+# Until the bound token has verified, a connection is untrusted: the sandbox
+# shares this loopback. It gets this many seconds -- wall clock, not per
+# recv, so a trickled byte does not reset it -- to deliver a request line and
+# headers that authenticate. Only then does the 300 s body/upstream budget
+# apply. Without this, 16 idle connections hold every handler slot below for
+# five minutes each and every session's Gateway access is denied meanwhile.
+PROXY_PREAUTH_DEADLINE_SECS = 10.0
+# ThreadingHTTPServer is otherwise unbounded: one incomplete
+# Content-Length holds a thread until the process dies.
+PROXY_MAX_INFLIGHT = 16
+# Per-boot token carried only in session-inject headers. Loopback is
+# same-host, not same-UID; without this the sandboxed agent can curl the
+# port and receive instance-role SigV4.
+PROXY_AUTH_HEADER = "X-Kirocrew-Proxy-Auth"
+# Session key HMAC-bound into the auth token so a revocation of the
+# originating session stops signing. Stripped hop-by-hop; never forwarded.
+PROXY_SESSION_HEADER = "X-Kirocrew-Proxy-Session"
+# HMAC-bound crew agent so a tighter task profile cannot be swapped
+# for the surface default by rewriting this header.
+PROXY_AGENT_HEADER = "X-Kirocrew-Proxy-Agent"
+#: The session GENERATION the inject registered before ``session/new``. The
+#: auth digest is bound to it and the handler requires it to be the generation
+#: currently registered for the session key, so a retired session's headers
+#: cannot regain signing authority when a successor reuses the same key.
+PROXY_GENERATION_HEADER = "X-Kirocrew-Proxy-Generation"
 _GATEWAY_HOST_MARKER = ".gateway.bedrock-agentcore."
+_GATEWAY_HOST_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.gateway\.bedrock-agentcore\.[a-z0-9-]+\.amazonaws\.com$"
+)
 _HOP_BY_HOP = frozenset(
     {
         "connection",
@@ -52,6 +85,10 @@ _HOP_BY_HOP = frozenset(
         "x-amz-security-token",
         "x-amz-content-sha256",
         "accept-encoding",
+        PROXY_AUTH_HEADER.lower(),
+        PROXY_SESSION_HEADER.lower(),
+        PROXY_AGENT_HEADER.lower(),
+        PROXY_GENERATION_HEADER.lower(),
     }
 )
 _ALLOWED_METHODS = frozenset({"GET", "POST", "DELETE", "HEAD"})
@@ -80,9 +117,30 @@ def preferred_bind_port() -> int:
     return PROXY_PREFERRED_PORT
 
 
+def is_agentcore_gateway_url(url: str) -> bool:
+    """True for an https AgentCore Gateway MCP hostname.
+
+    The proxy signs with the instance role. An arbitrary https URL would
+    receive those SigV4 headers, so only
+    ``*.gateway.bedrock-agentcore.<region>.amazonaws.com`` is a legal
+    upstream.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or parsed.username or parsed.password or parsed.fragment:
+        return False
+    host = (parsed.hostname or "").lower()
+    return _GATEWAY_HOST_RE.fullmatch(host) is not None
+
+
 def region_from_gateway_url(url: str) -> str:
     """Return the region embedded in a Gateway MCP hostname, or env fallback."""
-    host = (urlparse(url).hostname or "").lower()
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        host = ""
     marker_at = host.find(_GATEWAY_HOST_MARKER)
     if marker_at >= 0:
         rest = host[marker_at + len(_GATEWAY_HOST_MARKER) :]
@@ -150,6 +208,12 @@ class GatewaySigV4Proxy:
         if not self._region:
             raise ValueError("AgentCore Gateway SigV4 needs a region")
         self._require_https = require_https
+        self.client_token = secrets.token_urlsafe(32)
+        # session key -> generation nonce registered at inject. Replaced (never
+        # appended) when a successor registers the same key, which retires the
+        # predecessor's headers even while its process is still alive.
+        self._generations: dict[str, str] = {}
+        self._generations_lock = threading.Lock()
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._listen_url = ""
@@ -162,6 +226,44 @@ class GatewaySigV4Proxy:
     def alive(self) -> bool:
         return self._httpd is not None and bool(self._listen_url)
 
+    def register_session(self, session_key: str) -> str:
+        """Mint and register the CURRENT generation for *session_key*.
+
+        Called by the inject that builds a session's proxy headers, before
+        ``session/new``. Registering replaces any earlier generation for the
+        key: a stalled predecessor whose teardown failed and whose key a
+        successor now reuses would otherwise present a digest the key-only
+        scheme still accepted, and the successor's liveness would authorize
+        the predecessor's ``InvokeGateway``.
+        """
+        generation = secrets.token_hex(16)
+        with self._generations_lock:
+            self._generations[session_key] = generation
+        return generation
+
+    def current_generation(self, session_key: str) -> str | None:
+        with self._generations_lock:
+            return self._generations.get(session_key)
+
+    def retire_session(self, session_key: str) -> None:
+        """Forget the key's generation (teardown); later hops for it are refused."""
+        with self._generations_lock:
+            self._generations.pop(session_key, None)
+
+    def session_headers(self, session_key: str, agent: str = "") -> dict[str, str]:
+        """Inject headers bound to a freshly registered generation."""
+        generation = self.register_session(session_key)
+        headers = {
+            PROXY_AUTH_HEADER: bound_proxy_auth_token(
+                self.client_token, session_key, agent, generation
+            ),
+            PROXY_SESSION_HEADER: session_key,
+            PROXY_GENERATION_HEADER: generation,
+        }
+        if agent:
+            headers[PROXY_AGENT_HEADER] = agent
+        return headers
+
     def start(self) -> str:
         """Bind the preferred loopback port (else ephemeral). Return the listen URL."""
         if self._httpd is not None:
@@ -169,15 +271,41 @@ class GatewaySigV4Proxy:
         handler = self._handler_class()
         preferred = preferred_bind_port()
 
-        class _LoopbackServer(ThreadingHTTPServer):
-            # Windows defaults this False; TIME_WAIT on the preferred port
-            # then fails the first bind and we fall back to ephemeral every
-            # restart. POSIX already reuses. Same-uid only — the listen
-            # address is 127.0.0.1.
+        class _BoundedProxyServer(ThreadingHTTPServer):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                self._handler_slots = threading.BoundedSemaphore(PROXY_MAX_INFLIGHT)
+                super().__init__(*args, **kwargs)
+
+            def process_request(self, request: Any, client_address: Any) -> None:
+                if not self._handler_slots.acquire(blocking=False):
+                    with contextlib.suppress(OSError):
+                        request.close()
+                    return
+                try:
+                    super().process_request(request, client_address)
+                except Exception:
+                    self._handler_slots.release()
+                    raise
+
+            def process_request_thread(self, request: Any, client_address: Any) -> None:
+                try:
+                    super().process_request_thread(request, client_address)
+                finally:
+                    self._handler_slots.release()
+
+        class _PreferredServer(_BoundedProxyServer):
+            # Do not reuse a live listener. Windows SO_REUSEADDR would
+            # otherwise succeed on an occupied preferred port and skip
+            # fallback. TIME_WAIT then falls back to ephemeral, which is
+            # the correct failure mode for this localhost hop.
+            allow_reuse_address = False
+
+        class _EphemeralServer(_BoundedProxyServer):
             allow_reuse_address = True
 
         try:
-            httpd = _LoopbackServer((PROXY_HOST, preferred), handler)
+            server_cls = _EphemeralServer if preferred == 0 else _PreferredServer
+            httpd = server_cls((PROXY_HOST, preferred), handler)
         except OSError:
             if preferred == 0:
                 raise
@@ -185,8 +313,7 @@ class GatewaySigV4Proxy:
                 "AgentCore SigV4 proxy preferred port %s in use; binding ephemeral",
                 preferred,
             )
-            httpd = _LoopbackServer((PROXY_HOST, 0), handler)
-        httpd.proxy = self  # type: ignore[attr-defined]
+            httpd = _EphemeralServer((PROXY_HOST, 0), handler)
         port = httpd.server_address[1]
         path = self._upstream.path or "/mcp"
         self._httpd = httpd
@@ -224,6 +351,53 @@ class GatewaySigV4Proxy:
 
         class _Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+            _agentcore_headers_sent = False
+
+            def setup(self) -> None:
+                super().setup()
+                self._preauth_timer: threading.Timer | None = None
+                self.connection.settimeout(PROXY_PREAUTH_DEADLINE_SECS)
+
+            def handle_one_request(self) -> None:
+                # Every request on the connection starts untrusted again
+                # (HTTP/1.1 keep-alive), so the deadline is re-armed here, not
+                # once in setup(). It also reclaims the slot of an authenticated
+                # caller that goes idle between requests.
+                self._arm_preauth_deadline()
+                try:
+                    super().handle_one_request()
+                except OSError:
+                    # The deadline shut the socket under a blocked read (Windows
+                    # raises where Linux returns b""); the connection is done.
+                    self.close_connection = True
+                finally:
+                    self._disarm_preauth_deadline()
+
+            def _arm_preauth_deadline(self) -> None:
+                self._disarm_preauth_deadline()
+                self.connection.settimeout(PROXY_PREAUTH_DEADLINE_SECS)
+                timer = threading.Timer(PROXY_PREAUTH_DEADLINE_SECS, self._expire_preauth)
+                timer.daemon = True
+                self._preauth_timer = timer
+                timer.start()
+
+            def _disarm_preauth_deadline(self) -> None:
+                timer = self._preauth_timer
+                self._preauth_timer = None
+                if timer is not None:
+                    timer.cancel()
+
+            def _expire_preauth(self) -> None:
+                # Unblocks whatever read the handler thread is in; the thread
+                # then exits handle_one_request and releases its slot.
+                with contextlib.suppress(OSError):
+                    self.connection.shutdown(socket.SHUT_RDWR)
+
+            def _authenticated(self) -> None:
+                # The caller holds this boot's bound token: the long body /
+                # upstream budget applies from here.
+                self._disarm_preauth_deadline()
+                self.connection.settimeout(PROXY_SOCKET_TIMEOUT_SECS)
 
             def log_message(self, _fmt: str, *_args: object) -> None:
                 # Status only. Never headers — Authorization is SigV4 material.
@@ -242,6 +416,43 @@ class GatewaySigV4Proxy:
                 self._handle()
 
             def _handle(self) -> None:
+                self._agentcore_headers_sent = False
+                presented = self.headers.get(PROXY_AUTH_HEADER) or ""
+                session_key = (self.headers.get(PROXY_SESSION_HEADER) or "").strip()
+                agent = (self.headers.get(PROXY_AGENT_HEADER) or "").strip()
+                generation = (self.headers.get(PROXY_GENERATION_HEADER) or "").strip()
+                expected = (
+                    bound_proxy_auth_token(proxy.client_token, session_key, agent, generation)
+                    if session_key
+                    else ""
+                )
+                # The exact generation registered for this key at inject, not
+                # merely any digest the per-boot token could have produced: a
+                # retired session presenting an older generation is refused
+                # even when a successor with the same key is live.
+                registered = proxy.current_generation(session_key) if session_key else None
+                stale_generation = not registered or not _auth_token_matches(generation, registered)
+                if (
+                    not session_key
+                    or not _auth_token_matches(presented, expected)
+                    or stale_generation
+                ):
+                    _audit_proxy_decision(
+                        session_key,
+                        False,
+                        reason=(
+                            "missing_session"
+                            if not session_key
+                            else (
+                                "proxy_generation"
+                                if _auth_token_matches(presented, expected) and stale_generation
+                                else "proxy_auth"
+                            )
+                        ),
+                    )
+                    self.send_error(401, "Unauthorized")
+                    return
+                self._authenticated()
                 method = self.command.upper()
                 if method not in _ALLOWED_METHODS:
                     self.send_error(405, "Method Not Allowed")
@@ -255,7 +466,23 @@ class GatewaySigV4Proxy:
                 if length < 0 or length > PROXY_BODY_MAX_BYTES:
                     self.send_error(413, "Payload Too Large")
                     return
-                body = self.rfile.read(length) if length else b""
+                try:
+                    body = self.rfile.read(length) if length else b""
+                except (TimeoutError, OSError):
+                    self.send_error(408, "Request Timeout")
+                    return
+                if length and len(body) != length:
+                    self.send_error(400, "Bad Request")
+                    return
+                # Recheck after the body is in hand. A stalled upload would
+                # otherwise keep a permit that was revoked before signing.
+                if not _workload_proxy_still_permitted(
+                    session_key,
+                    agent=agent,
+                    upstream_url=proxy.upstream_url,
+                ):
+                    self.send_error(403, "Forbidden")
+                    return
                 parsed = urlparse(self.path)
                 target = proxy.target_url(parsed.query)
                 incoming = _filter_incoming_headers(dict(self.headers))
@@ -273,6 +500,11 @@ class GatewaySigV4Proxy:
                         "agentcore sigv4 proxy failed to sign or forward",
                         exc_info=True,
                     )
+                    # Headers already flushed: a second status line would
+                    # append onto the MCP body the client is already reading.
+                    if getattr(self, "_agentcore_headers_sent", False):
+                        self.close_connection = True
+                        return
                     self.send_error(502, "Bad Gateway")
 
         return _Handler
@@ -293,13 +525,11 @@ class GatewaySigV4Proxy:
             handler.send_error(502, "Bad Gateway")
             return
         if parsed.scheme == "https":
-            conn: http.client.HTTPConnection = (
-                http.client.HTTPSConnection(  # nosemgrep: python.lang.security.audit.httpsconnection-detected.httpsconnection-detected
-                    parsed.hostname or "",
-                    parsed.port or 443,
-                    timeout=PROXY_SOCKET_TIMEOUT_SECS,
-                    context=ssl.create_default_context(),
-                )
+            conn: http.client.HTTPConnection = http.client.HTTPSConnection(  # nosemgrep
+                parsed.hostname or "",
+                parsed.port or 443,
+                timeout=PROXY_SOCKET_TIMEOUT_SECS,
+                context=ssl.create_default_context(),
             )
         else:
             conn = http.client.HTTPConnection(
@@ -320,13 +550,19 @@ class GatewaySigV4Proxy:
                 handler.send_header(key, value)
             handler.send_header("Connection", "close")
             handler.end_headers()
+            setattr(handler, "_agentcore_headers_sent", True)
             if method != "HEAD":
-                while True:
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    handler.wfile.write(chunk)
-                    handler.wfile.flush()
+                try:
+                    while True:
+                        chunk = resp.read1(65536)
+                        if not chunk:
+                            break
+                        handler.wfile.write(chunk)
+                        handler.wfile.flush()
+                except OSError:
+                    # Client or upstream dropped after headers. Do not
+                    # re-raise into _handle — that path must not emit 502.
+                    return
         finally:
             with contextlib.suppress(OSError):
                 conn.close()
@@ -335,7 +571,7 @@ class GatewaySigV4Proxy:
 def ensure_workload_proxy(upstream_url: str) -> str | None:
     """Start (or reuse) the process-wide workload proxy. ``None`` fails closed."""
     global _PROXY
-    if not upstream_url.startswith("https://"):
+    if not is_agentcore_gateway_url(upstream_url):
         return None
     try:
         import botocore  # noqa: F401
@@ -372,3 +608,181 @@ def reset_workload_proxy() -> None:
         if _PROXY is not None:
             _PROXY.stop()
             _PROXY = None
+
+
+def workload_proxy_auth_token() -> str | None:
+    """Per-boot proxy token, or ``None`` when the listener is down."""
+    with _LOCK:
+        if _PROXY is None or not _PROXY.alive:
+            return None
+        return _PROXY.client_token
+
+
+def bound_proxy_auth_token(
+    client_token: str, session_key: str, agent: str = "", generation: str = ""
+) -> str:
+    """HMAC the per-boot token with the originating session, agent and generation."""
+    material = session_key if not agent else f"{session_key}\0{agent}"
+    if generation:
+        material = f"{material}\0gen:{generation}"
+    return hmac.new(
+        client_token.encode("utf-8"),
+        material.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def proxy_auth_headers(session_key: str, *, agent: str = "") -> dict[str, str]:
+    """Session-bound inject headers, or empty when the listener is down."""
+    if not session_key:
+        return {}
+    proxy = _live_proxy()
+    if proxy is None:
+        return {}
+    return proxy.session_headers(session_key, agent)
+
+
+def retire_proxy_session(session_key: str) -> None:
+    """Forget any generation registered for *session_key* on the process proxy.
+
+    The inject that decides a session's Gateway contribution calls this FIRST,
+    before its own gates: a successor that reuses a key must retire the
+    predecessor's generation whether or not the successor is itself granted a
+    Gateway. Otherwise a denied successor (profile denies AgentCore, posture
+    left ``workload``, listener down) would leave a stalled predecessor's
+    generation registered and its signed hops still honoured -- the stalled-
+    reuse case the generation binding exists to close. A replacement
+    generation is minted only by :func:`proxy_auth_headers`, after every gate
+    has passed. Retires on the proxy object even when its listener is down, so
+    a later restart cannot resurrect a stale registration.
+    """
+    if not session_key:
+        return
+    with _LOCK:
+        proxy = _PROXY
+    if proxy is not None:
+        proxy.retire_session(session_key)
+
+
+def _live_proxy() -> "GatewaySigV4Proxy | None":
+    """The process-wide proxy when its listener is up, else ``None``."""
+    with _LOCK:
+        return _PROXY if _PROXY is not None and _PROXY.alive else None
+
+
+def _audit_proxy_decision(session_key: str, permitted: bool, reason: str = "") -> None:
+    try:
+        from kiro_crew.sel import sel
+
+        sel().log_governance_decision(
+            session_key=session_key,
+            tool_name="agentcore.sigv4_proxy",
+            scope="capabilities.agentcore",
+            outcome="allowed" if permitted else "denied",
+            reason=reason,
+        )
+    except Exception:
+        logger.debug("agentcore sigv4 proxy decision audit failed", exc_info=True)
+
+
+def _session_key_is_live(session_key: str) -> bool:
+    """True when *session_key* is still registered, or is the host inspect key.
+
+    A shared runtime can keep ``X-Kirocrew-Proxy-*`` headers after a
+    child session closes. Profile resolution does not require a live
+    map entry, so this check is what stops signed hops for a torn-down
+    key. ``HOST_SESSION_KEY`` is the owner-dashboard catalog path and
+    is never registered as an ACP session.
+    """
+    from kiro_crew.platform.governance_profiles import HOST_SESSION_KEY
+
+    if session_key == HOST_SESSION_KEY:
+        return True
+    try:
+        from kiro_crew.session import iter_live_session_managers
+    except Exception:
+        return False
+    try:
+        managers = list(iter_live_session_managers())
+    except Exception:
+        return False
+    for mgr in managers:
+        # A fresh session is only RESERVED while ``session/new`` runs, and the
+        # Gateway MCP initialize happens inside that window; a registry-only
+        # check would 403 every first hop. The reservation is the registry's
+        # own claim on the key, so it counts as live here. Judged per manager:
+        # a registry that cannot answer (torn down mid-shutdown) is "not live
+        # here", never a veto over a sibling registry that does hold the key.
+        try:
+            if mgr.has_session(session_key) or mgr.has_allocation_reservation(session_key):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _workload_proxy_still_permitted(
+    session_key: str, *, agent: str = "", upstream_url: str = ""
+) -> bool:
+    """True only when the originating session may still use this hop's proxy.
+
+    Rechecked on every hop so a mid-process revocation of that session's
+    profile stops signing even though the proxy listener is already up.
+    The capability decision uses the calling session's profile (never the
+    host ``_host`` surface). The policy posture must be ``workload`` —
+    ``login`` uses JWT inbound, not instance IAM. *upstream_url* is the
+    handling proxy's configured Gateway, not the process-wide
+    ``_PROXY``: a stalled request on listener A must not authorize
+    against a replacement listener B and then sign to A. Fail closed
+    when *upstream_url* is empty. A torn-down session key is refused
+    even when its profile would still permit. Both outcomes are SEL-audited.
+    """
+    if not session_key:
+        _audit_proxy_decision("", False, reason="missing_session")
+        return False
+    if not _session_key_is_live(session_key):
+        _audit_proxy_decision(session_key, False, reason="session_not_live")
+        return False
+    try:
+        from kiro_crew.platform.context import current_context
+        from kiro_crew.platform.governance import resolve
+        from kiro_crew.platform.governance_profiles import resolve_active_scope
+
+        ceiling = current_context().governance
+        profile = resolve_active_scope(session_key, agent=agent)
+        decision = resolve(ceiling, profile, "capabilities.agentcore", "")
+        permitted = bool(getattr(decision, "permitted", False))
+        if not permitted:
+            _audit_proxy_decision(
+                session_key, False, reason=str(getattr(decision, "reason", "") or "")
+            )
+            return False
+        # EFFECTIVE posture and URL (ceiling first, launch env / home authoring
+        # only when no ceiling is loaded): a CloudFormation instance configures
+        # AgentCore through its unit environment and may have no policy document,
+        # and a ceiling-only read there refuses every hop as ``not_workload``.
+        from kiro_crew.platform.agentcore_aws import resolved_gateway_url, resolved_posture
+
+        if resolved_posture() != "workload":
+            _audit_proxy_decision(session_key, False, reason="not_workload")
+            return False
+        current_url = (resolved_gateway_url() or "").rstrip()
+        handling_url = (upstream_url or "").rstrip()
+        if not current_url or not handling_url or handling_url != current_url:
+            _audit_proxy_decision(session_key, False, reason="upstream_mismatch")
+            return False
+        _audit_proxy_decision(session_key, True)
+        return True
+    except Exception:
+        _audit_proxy_decision(session_key, False, reason="recheck_failed")
+        return False
+
+
+def _auth_token_matches(presented: str, expected: str) -> bool:
+    if not presented or not expected:
+        return False
+    left = presented.encode("utf-8")
+    right = expected.encode("utf-8")
+    if len(left) != len(right):
+        return False
+    return hmac.compare_digest(left, right)
