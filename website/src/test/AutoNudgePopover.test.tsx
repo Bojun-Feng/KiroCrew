@@ -120,12 +120,15 @@ describe('AutoNudgePopover goal persistence', () => {
     expect(loadGoalDraft(SLOT)).toBeNull()
   })
 
-  it('falsy loop fields fall back to default template / 60 / 0, not bare "" / 0 (|| not ??)', () => {
-    // A loop with an empty message and idle_secs/max_cycles of 0 must show the
-    // default template + 60 — falsy loop fields fall back (|| not ??).
+  it('falsy loop fields fall back to default template / 60, not bare "" / 0 (|| not ??); a loop\'s max_cycles 0 stays 0', () => {
+    // A loop with an empty message and idle_secs of 0 must show the default
+    // template + 60 — falsy loop fields fall back (|| not ??). Its max_cycles
+    // of 0 is a real "no cap" and must NOT be replaced by the fresh-popover
+    // default of 24.
     renderPopover(makeLoop({ message: '', idle_secs: 0, max_cycles: 0 }))
     expect(goalBox().value).toContain('north star')
     expect((screen.getByDisplayValue('60') as HTMLInputElement).value).toBe('60')
+    expect((screen.getAllByRole('spinbutton')[1] as HTMLInputElement).value).toBe('0')
   })
 })
 
@@ -165,7 +168,9 @@ describe('AutoNudgePopover number-field editing (idle / max cycles)', () => {
 
   it('empty max-cycles commits to 0 (infinity) on blur', () => {
     renderPopover(null)
-    expect(cyclesField().value).toBe('0')
+    // A fresh popover proposes a finite cap; clearing the field is the way
+    // to ask for no cap.
+    expect(cyclesField().value).toBe('24')
     fireEvent.change(cyclesField(), { target: { value: '' } })
     expect(cyclesField().value).toBe('')
     fireEvent.blur(cyclesField())
@@ -189,6 +194,26 @@ describe('AutoNudgePopover number-field editing (idle / max cycles)', () => {
     expect(save, 'no /api/autonudge write was issued').toBeTruthy()
     const body = JSON.parse(save![1]!.body!)
     expect(body.idle_secs).toBe(45)
+  })
+
+  const savedBody = () => {
+    const calls = (fetch as unknown as { mock: { calls: [string, { body?: string }?][] } }).mock.calls
+    const save = calls.find(c => String(c[0]).startsWith('/api/autonudge') && c[1]?.body)
+    expect(save, 'no /api/autonudge write was issued').toBeTruthy()
+    return JSON.parse(save![1]!.body!)
+  }
+
+  it('the pristine default posts max_cycles 24, so Start loop never silently arms an endless loop', async () => {
+    renderPopover(null)
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Start loop/i })) })
+    expect(savedBody().max_cycles).toBe(24)
+  })
+
+  it('typing 0 into max-cycles still posts 0 (no cap)', async () => {
+    renderPopover(null)
+    fireEvent.change(cyclesField(), { target: { value: '0' } })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Start loop/i })) })
+    expect(savedBody().max_cycles).toBe(0)
   })
 })
 

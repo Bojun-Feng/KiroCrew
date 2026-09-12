@@ -2206,7 +2206,7 @@ export default function MembersPage() {
                           title={activePatrol.banner || activePatrol.message}
                           data-testid="member-patrol-instruction"
                         >
-                          {(activePatrol.banner || activePatrol.message).split('\n')[0]}
+                          {(activePatrol.banner || activePatrol.message || '').split('\n')[0]}
                         </dd>
                       </div>
                     )}

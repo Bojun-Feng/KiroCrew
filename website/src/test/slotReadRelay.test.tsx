@@ -48,7 +48,6 @@ vi.mock('../api/client', () => ({
     notifications: vi.fn().mockResolvedValue({ notifications: [], unread: 0 }),
     chatSlotDetail: vi.fn().mockResolvedValue({ messages: [], running: false, has_more: false, total: 0, queue: [] }),
     autonudgeList: vi.fn().mockResolvedValue({ enabled: false, loops: [] }),
-    monitorsList: vi.fn().mockResolvedValue({ enabled: false, monitors: [] }),
     pendingQuestions: vi.fn().mockResolvedValue([]),
     sessions: vi.fn().mockResolvedValue({ sessions: [], has_more: false }),
   },

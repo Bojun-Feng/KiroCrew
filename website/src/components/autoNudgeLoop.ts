@@ -12,7 +12,10 @@ import { fmtDuration } from '../i18n/format'
 export interface AutoNudgeLoop {
   id: string
   slot_key: string
-  message: string
+  /** Absent on reduced structured-monitor rows from the legacy slot read. */
+  message?: string
+  /** Present on live websocket frames for structured monitors. */
+  monitor?: unknown
   idle_secs: number
   max_cycles: number
   cycle_count: number
@@ -52,6 +55,12 @@ export interface AutoNudgeListResponse {
  *  websocket hook invalidates it on every `autonudge_state` frame and on every
  *  (re)connect, so any reader of this key is live without its own listener. */
 export const AUTONUDGE_LOOPS_QUERY_KEY = ['autonudge-loops'] as const
+
+/** Structured monitors have two transport shapes: REST withholds `message`,
+ * while live websocket frames carry `monitor` alongside the wake instructions. */
+export function isReducedMonitorRow(loop: AutoNudgeLoop | null | undefined): boolean {
+  return !!loop && (loop.monitor !== undefined || loop.message === undefined)
+}
 
 /** Cycle readout: "3/24" when a finite cap is armed, and a bare "3" when
  *  max_cycles is 0, which means infinite -- a loop with no backstop has no
