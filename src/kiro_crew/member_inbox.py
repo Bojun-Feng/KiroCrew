@@ -3,11 +3,14 @@
 Implements the on-disk half of the member inbox model RFC (``rfc-member-inbox-model``):
 
 * an **inbox** — append-only, one JSON file per envelope under
-  ``member_dir(slug)/inbox/``, fsync'd on write so a restart cannot lose a
+  ``member_store_dir(slug)/inbox/``, fsync'd on write so a restart cannot lose a
   message that was acknowledged to its sender;
 * an **outbox** — the member's own replies and mirrored peer sends, same shape,
-  under ``member_dir(slug)/outbox/``;
-* a **dead-letter** directory for envelopes that crashed every wake.
+  under ``member_store_dir(slug)/outbox/``;
+* a **dead-letter** directory for envelopes that crashed every wake;
+* (M1) a **read marker** (``read.json``) — the newest projection row the person
+  has seen, so ``unread`` is a durable count and not a per-tab flag — and the
+  :func:`projection` merge the Members page renders.
 
 Envelopes are immutable once written. Acknowledgement and attempt counting are
 recorded by rewriting the envelope into its new place (``inbox/acked/`` or
@@ -66,6 +69,8 @@ WAKE_CONTEXT_FRESH = "fresh"
 #: ``refs`` marker on the ``system`` outbox row a wake writes when it could not
 #: resume the member's conversation and started a new one.
 WAKE_CONTEXT_RESET_REF = "wake_context_reset"
+#: Per-member read marker (M1): the newest projection row the person has seen.
+READ_MARKER_FILE_NAME = "read.json"
 #: Root of every member's inbox / outbox / dead-letter state: a TOP-LEVEL leaf of
 #: the crew home, bind-masked from every sandbox mode (``sandbox._CREW_HIDDEN_LEAVES``)
 #: and fenced from agent file tools (``security.paths._CREW_SECRET_LEAVES``). Not the
@@ -90,17 +95,20 @@ WAKE_SLOT_MODE = _WAKE_SLOT_MODE
 #: :func:`member_owner_key` folds it back to the member for ownership.
 WAKE_KEY_INFIX = ".wake-"
 
-#: The kinds M0 PRODUCES. ``user_dm`` is the person typing in the thread;
+#: The kinds the gateway PRODUCES. ``user_dm`` is the person typing in the thread;
 #: ``session_dm`` is another session's ``session_send`` translated by the shim
 #: (its own kind, so "not the owner" is a property of the kind and not of a
-#: field); ``peer_dm`` is another member's ``peer_send``; ``wake_timer`` is the
-#: member's own cadence; ``system`` is a gateway notice. Kinds arrive with the
+#: field); ``peer_dm`` is another member's ``peer_send``; ``worker_report`` (M1)
+#: is the reply tail of a session the member created finishing a turn
+#: (``member_wake.report_worker_turn``); ``wake_timer`` is the member's own
+#: cadence; ``system`` is a gateway notice. Kinds arrive with the
 #: milestone that writes them (``make_envelope`` refuses an unknown kind, so no
 #: file can carry one before its producer exists).
 ENVELOPE_KINDS: tuple[str, ...] = (
     "user_dm",
     "session_dm",
     "peer_dm",
+    "worker_report",
     "wake_timer",
     "system",
 )
@@ -508,7 +516,11 @@ def compact_member(slug: str) -> int:
     and pruning them would refill a budget only the owner may refill.
     """
     inbox = InboxStore(slug)
-    return inbox.compact() + OutboxStore(slug).compact(keep_peer_since=inbox.last_user_dm_at())
+    marker = read_marker(slug)
+    return inbox.compact() + OutboxStore(slug).compact(
+        keep_peer_since=inbox.last_user_dm_at(),
+        keep_unread_after=(marker["last_read_at"], marker["last_read_id"]),
+    )
 
 
 def _list_envelopes(dir_path: Path) -> list[Envelope]:
@@ -721,6 +733,21 @@ class InboxStore:
                 newest = env.created_at
         return newest
 
+    def worker_reports_since(self, since_iso: str) -> int:
+        """How many ``worker_report`` envelopes landed after *since_iso* (all states)."""
+        return sum(
+            1
+            for e in self.pending() + self.acked() + self.dead_letters()
+            if e.kind == "worker_report" and e.created_at > since_iso
+        )
+
+    def has_system_notice_since(self, reason: str, since_iso: str) -> bool:
+        """Whether a ``system`` envelope tagged ``refs.reason == reason`` exists after *since_iso*."""
+        return any(
+            e.kind == "system" and e.refs.get("reason") == reason and e.created_at > since_iso
+            for e in self.pending() + self.acked() + self.dead_letters()
+        )
+
 
 class OutboxStore:
     """The member's own rows: replies into the projection and mirrored sends."""
@@ -736,20 +763,25 @@ class OutboxStore:
             raise InboxError("outbox body is empty")
         if len(body) > MAX_BODY_CHARS:
             raise InboxError(f"outbox body exceeds {MAX_BODY_CHARS} characters")
-        env = Envelope(
-            id=new_envelope_id(),
-            from_=f"member:{self.slug}",
-            to=(
-                f"member:{self.slug}"
-                if kind == OUTBOX_REPLY_KIND
-                else str((refs or {}).get("to", ""))
-            ),
-            kind=kind,
-            body=body,
-            hop=max(0, int(hop)),
-            refs=dict(refs or {}),
-        )
-        with member_store_lock(self.slug):
+        # Minted AND written under the member's marker lock (the read marker is
+        # advanced from a projection read under the same lock, so a row cannot be
+        # timestamped before a marker write and land behind it) and under the
+        # store lock every envelope read-modify-write takes (`mark`); marker
+        # first, store second, the one order every caller uses.
+        with member_marker_lock(self.slug), member_store_lock(self.slug):
+            env = Envelope(
+                id=new_envelope_id(),
+                from_=f"member:{self.slug}",
+                to=(
+                    f"member:{self.slug}"
+                    if kind == OUTBOX_REPLY_KIND
+                    else str((refs or {}).get("to", ""))
+                ),
+                kind=kind,
+                body=body,
+                hop=max(0, int(hop)),
+                refs=dict(refs or {}),
+            )
             _write_envelope(self.root / f"{env.id}.json", env)
         return env
 
@@ -814,13 +846,24 @@ class OutboxStore:
         """How many ``peer_dm`` rows this member has sent after *since_iso*."""
         return sum(1 for e in self.rows() if e.kind == "peer_dm" and e.created_at > since_iso)
 
-    def compact(self, *, keep_peer_since: str = "") -> int:
+    def compact(
+        self, *, keep_peer_since: str = "", keep_unread_after: tuple[str, str] = ("", "")
+    ) -> int:
         """Prune outbox rows beyond ``RETAIN_OUTBOX``, oldest first.
 
-        ``peer_dm`` rows newer than *keep_peer_since* (the member's budget
-        anchor, see :func:`compact_member`) are never pruned: ``peer_sends_since``
-        counts them, so evicting them under a run of newer ``reply`` rows would
-        reset the unattended-send budget without the owner having written.
+        Two kinds of row are never pruned, however old:
+
+        * ``peer_dm`` rows newer than *keep_peer_since* (the member's budget
+          anchor, see :func:`compact_member`): ``peer_sends_since`` counts them,
+          so evicting them under a run of newer ``reply`` rows would reset the
+          unattended-send budget without the owner having written.
+        * Rows the person has NOT read -- ``(created_at, id)`` after
+          *keep_unread_after*, the read marker. They are the projection's
+          unread rows; a hard delete here would silently drop a reply the
+          badge still promises (and the count with it). A member that talks
+          more than the person reads therefore holds more than
+          ``RETAIN_OUTBOX`` rows until the thread is opened; that is the
+          retention giving way to the record, not the other way round.
         """
         rows = self.rows()
         excess = max(0, len(rows) - RETAIN_OUTBOX)
@@ -829,6 +872,8 @@ class OutboxStore:
             if excess <= 0:
                 break
             if env.kind == "peer_dm" and env.created_at > keep_peer_since:
+                continue
+            if (env.created_at, env.id) > keep_unread_after:
                 continue
             removed += _unlink_quiet(self.root / f"{env.id}.json")
             excess -= 1
@@ -845,3 +890,152 @@ def recent_exchange(slug: str, limit: int = 6) -> list[Envelope]:
     rows += [e for e in OutboxStore(slug).rows() if e.kind in (OUTBOX_REPLY_KIND, "peer_dm")]
     rows.sort(key=lambda e: (e.created_at, e.id))
     return rows[-limit:] if limit > 0 else rows
+
+
+# --------------------------------------------------------------- projection (M1)
+
+
+def projection(slug: str) -> list[dict[str, Any]]:
+    """Time-ordered merge of a member's inbox (all states) and outbox.
+
+    What the Members page renders under the inbox model (``GET
+    /api/members/{slug}/projection``). Each row carries ``direction`` (``in`` /
+    ``out``) and ``state`` (``pending`` / ``acked`` / ``dead`` / ``sent``) so the
+    client can badge by kind without re-deriving. Every row; the handler decides
+    the served window (:func:`served_window`).
+    """
+    inbox = InboxStore(slug)
+    rows: list[dict[str, Any]] = []
+    for env in inbox.pending():
+        rows.append({**env.to_dict(), "direction": "in", "state": "pending"})
+    for env in inbox.acked():
+        rows.append({**env.to_dict(), "direction": "in", "state": "acked"})
+    for env in inbox.dead_letters():
+        rows.append({**env.to_dict(), "direction": "in", "state": "dead"})
+    for env in OutboxStore(slug).rows():
+        # A peer_dm mirror whose delivery to the receiver's inbox failed
+        # (`refs.delivery == member_peer.DELIVERY_FAILED`; the literal is used
+        # because member_peer imports this module) is undeliverable, not sent.
+        failed = env.kind == "peer_dm" and env.refs.get("delivery") == "failed"
+        rows.append({**env.to_dict(), "direction": "out", "state": "dead" if failed else "sent"})
+    rows.sort(key=lambda r: (str(r.get("created_at", "")), str(r.get("id", ""))))
+    return rows
+
+
+def served_window(
+    rows: list[dict[str, Any]], marker: dict[str, str], limit: int
+) -> list[dict[str, Any]]:
+    """The rows the projection endpoint returns: the newest *limit*, widened
+    backwards to include EVERY row newer than the read marker.
+
+    The marker means "everything up to here was seen", and the client advances
+    it to the newest row it rendered. If the window hid an older unread row,
+    that advance would silently mark it read -- so the window can never start
+    after the first unread row. A thread that accumulates unread faster than
+    the person reads it grows the response rather than losing rows.
+    """
+    if limit <= 0 or len(rows) <= limit:
+        return rows
+    since = (marker.get("last_read_at", ""), marker.get("last_read_id", ""))
+    first_unread = next((i for i, r in enumerate(rows) if _row_order(r) > since), len(rows))
+    start = min(len(rows) - limit, first_unread)
+    return rows[start:]
+
+
+# -------------------------------------------------------------------- read marker
+
+
+def _row_order(row: dict[str, Any]) -> tuple[str, str]:
+    return (str(row.get("created_at", "")), str(row.get("id", "")))
+
+
+def read_marker(slug: str) -> dict[str, str]:
+    """``{"last_read_id", "last_read_at"}`` of the newest row the person has seen.
+
+    Both empty when nothing was ever marked read. Tolerant read: a malformed or
+    missing file is "never read", never an error, because the marker only
+    drives a badge.
+    """
+    path = member_store_dir(slug) / READ_MARKER_FILE_NAME
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"last_read_id": "", "last_read_at": ""}
+    if not isinstance(raw, dict):
+        return {"last_read_id": "", "last_read_at": ""}
+    return {
+        "last_read_id": str(raw.get("last_read_id") or ""),
+        "last_read_at": str(raw.get("last_read_at") or ""),
+    }
+
+
+#: One lock per member for the read-compare-write of the marker. Two tabs (or a
+#: tab and the roster) marking read at once must serialize on the STORED value:
+#: without it both compare against the same stale read and the older write can
+#: land last, moving the marker backwards and resurrecting unread rows.
+#: Re-entrant, because the read endpoint holds it across ``projection`` +
+#: ``write_read_marker`` (which takes it again) so the rows it decides on and the
+#: marker it writes are one transaction against ``OutboxStore.append``.
+_marker_locks: dict[str, threading.RLock] = {}
+_marker_locks_guard = threading.Lock()
+
+
+def _marker_lock(slug: str) -> threading.RLock:
+    with _marker_locks_guard:
+        lock = _marker_locks.get(slug)
+        if lock is None:
+            lock = _marker_locks[slug] = threading.RLock()
+        return lock
+
+
+def member_marker_lock(slug: str) -> threading.RLock:
+    """The per-member lock that serializes outbox appends against the
+    projection-read + marker-write transaction. Filesystem-bound callers only."""
+    return _marker_lock(validate_slug(slug))
+
+
+def write_read_marker(slug: str, row: dict[str, Any] | None) -> dict[str, str]:
+    """Advance the marker to *row* (a projection row). Never moves backwards.
+
+    Compare-and-set against the stored value under the member's marker lock, so
+    concurrent updates serialize and the newest position always wins. ``None``
+    (an empty projection) leaves the file untouched and returns the current
+    marker, so a read of an empty thread cannot erase an earlier one.
+    """
+    if row is None or not row.get("id"):
+        return read_marker(slug)
+    candidate = {
+        "last_read_id": str(row.get("id", "")),
+        "last_read_at": str(row.get("created_at", "")),
+    }
+    with _marker_lock(validate_slug(slug)):
+        current = read_marker(slug)
+        if (candidate["last_read_at"], candidate["last_read_id"]) <= (
+            current["last_read_at"],
+            current["last_read_id"],
+        ):
+            return current
+        path = member_store_dir(slug) / READ_MARKER_FILE_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(path, json.dumps(candidate), fsync=False)
+        return candidate
+
+
+def is_unread_row(row: dict[str, Any]) -> bool:
+    """Whether a projection row counts toward the badge.
+
+    Per the RFC, unread = OUTBOX rows newer than the marker: what the member
+    said (its replies and the peer messages it sent). Inbound rows are input the
+    member has not acted on yet, and the person's own ``user_dm`` is what they
+    typed — neither is news to them.
+    """
+    return row.get("direction") == "out"
+
+
+def unread_count(slug: str, rows: list[dict[str, Any]] | None = None) -> int:
+    """Outbox rows newer than the read marker. *rows* avoids a second disk scan."""
+    marker = read_marker(slug)
+    since = (marker["last_read_at"], marker["last_read_id"])
+    if rows is None:
+        rows = projection(slug)
+    return sum(1 for r in rows if is_unread_row(r) and _row_order(r) > since)
