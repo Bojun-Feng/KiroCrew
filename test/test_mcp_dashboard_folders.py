@@ -1814,6 +1814,9 @@ class TestAdvertisedSet:
             "session_close",
             "session_send",
             "session_read_message",
+            # member inbox model: the two member tools ride the same server
+            "outbox_send",
+            "peer_send",
         }
 
 

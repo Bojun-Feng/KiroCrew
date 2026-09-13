@@ -379,6 +379,39 @@ from kiro_crew.stt.models import DEFAULT_MODEL as _STT_DEFAULT_MODEL
 
 logger = logging.getLogger(__name__)
 
+
+def _fail_closed_member_peer_dm(data: dict) -> None:
+    """Keep a malformed peer-DM kill switch DENYING, and on record.
+
+    ``member_peer_dm`` is a security gate: optional JSON Schema validation would
+    prune a present-but-malformed section (or a non-boolean ``enabled``) before
+    dataclass construction, and the loader would then read the permissive
+    default -- the fail-open the admission exists to prevent, and one that only
+    happens on hosts where ``jsonschema`` is installed. Normalize the value to
+    ``enabled: false`` first and record the section as degraded, so the
+    admission path denies with ``peer_dm_config_degraded`` on every host.
+
+    Lives in the loader (not ``config.resolution``) because the loader's
+    re-export surface from that module is frozen by
+    ``test_config_module_boundaries``; this is loader-internal normalization.
+    """
+    if "member_peer_dm" not in data:
+        return
+    section = data["member_peer_dm"]
+    malformed = not isinstance(section, dict) or (
+        "enabled" in section and not isinstance(section["enabled"], bool)
+    )
+    if not malformed:
+        return
+    _OBSERVED_DEGRADED_SECTIONS.add("member_peer_dm")
+    logger.warning(
+        "config: 'member_peer_dm' is malformed (got %s) — peer messaging between "
+        "members is DENIED until it is fixed",
+        type(section).__name__ if not isinstance(section, dict) else "non-boolean enabled",
+    )
+    data["member_peer_dm"] = {"enabled": False}
+
+
 # Credential keys loaded from .env / environment
 CRED_SLACK_APP_TOKEN = "SLACK_APP_TOKEN"
 CRED_SLACK_BOT_TOKEN = "SLACK_BOT_TOKEN"
@@ -2650,6 +2683,26 @@ class KiroCrewConfig:
         default_factory=dict,
         metadata=_meta("Hooks", "Script hook definitions keyed by hook ID."),
     )
+    # Crew-member inbox model (docs/system-specs/modules/session-control.md, Configuration).
+    # Plain mappings like ``hooks``: the readers in ``member_inbox`` /
+    # ``member_peer`` validate shape at the point of use and fail CLOSED on a
+    # malformed value, so no coercion happens here -- a wrong-typed value must
+    # stay visible as wrong, not be silently defaulted into "enabled".
+    members: dict = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Members",
+            "Per-member settings keyed by member slug: inbox_model, "
+            "wake_interval_secs, peer_dm.accept, peer_dm.send.",
+        ),
+    )
+    member_peer_dm: dict = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Member Peer DM",
+            "Global switch for member-to-member messages (enabled).",
+        ),
+    )
     slack_channels: dict[str, ChannelConfig] = field(
         default_factory=dict,
         metadata=_meta("Slack Channels", "Per-channel activation config."),
@@ -3011,6 +3064,8 @@ class KiroCrewConfig:
             _fail_closed_project_skills_config(
                 data, config_source_unreadable=config_source_unreadable
             )
+            # Same rule for the member peer-DM kill switch (see the helper).
+            _fail_closed_member_peer_dm(data)
 
             # Return defaults only if neither file was successfully loaded. Seed
             # the default "kirocrew" agent in-memory (matching the on-disk
@@ -4094,6 +4149,8 @@ class KiroCrewConfig:
                 name_override=str(tunnel_data.get("name_override", "")),
             ),
             hooks=data.get("hooks", {}),
+            members=data.get("members", {}),
+            member_peer_dm=data.get("member_peer_dm", {}),
             agents=agents,
             default_agent=default_agent_val,
             workspaces=workspaces,
@@ -4619,6 +4676,8 @@ class KiroCrewConfig:
             "dashboard": asdict(self.dashboard),
             "tunnel": asdict(self.tunnel),
             "hooks": self.hooks,
+            "members": self.members,
+            "member_peer_dm": self.member_peer_dm,
             "agents": {name: asdict(agent_cfg) for name, agent_cfg in self.agents.items()},
             "default_agent": self.default_agent,
             "workspaces": {name: asdict(ws_cfg) for name, ws_cfg in self.workspaces.items()},
