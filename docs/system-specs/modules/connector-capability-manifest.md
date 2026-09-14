@@ -92,7 +92,7 @@ Every required operation the connector campaign tracks — one row per
 |---|---|---|---|
 | `operation_id` | string | yes | Stable identifier. Does not change across campaign rounds once assigned. |
 | `provider` | string | yes | The vendor's own name for its surface (e.g. `github`), matching that vendor's own official branding. |
-| `service_id` | string | yes | The campaign's neutral service-range identifier (e.g. `github`, `gmail`, `excel_shared_engine`) — one of the fixed set the campaign's evidence catalog defines. |
+| `service_id` | enum | yes | The campaign's neutral service-range identifier. One of: `github`, `gmail`, `google_drive`, `sharepoint`, `outlook`, `onedrive`, `onenote`, `teams`, `excel_shared_engine`, `office_documents`, `slack`, `asana`, `salesforce`, `zoom` — the 12 named service ranges plus the two Office capability sets (`excel_shared_engine`, `office_documents`), which are horizontal capability groups spanning SharePoint/OneDrive rather than a 13th provider (see the DAG note on `W07` below). This is the complete, closed set for the current campaign round; a validator checks membership against this list directly, not against anything outside this document. Adding a service range is a scoped revision of this enum, in the same way any other manifest field evolves under the owning-spec rule. |
 | `required` | boolean | yes | Whether the operation is in the campaign's required scope. |
 | `category` | enum | yes | One of `baseline_alignment`, `production_requirement`, `user_extension`. This field renames evidence into a requirement class; it never shrinks scope on its own. |
 | `source_status` | enum | yes | `user_required` / `official_baseline` / `unverified` — see "Two axes" above. |
