@@ -10,6 +10,8 @@
  *                                 placeholder (empty value = still inherited)
  *   03 create, emoji panel open → the inline picker grid + custom-emoji field
  *   04 edit (Folder settings)   → every field prefilled from the folder
+ *   05 edit, orphan agent       → the "(not installed)" label plus the inline
+ *                                 aria-describedby notice under the field
  *
  * Usage: node scripts/capture-folder-modal.mjs [outDir] [prefix]
  */
@@ -29,6 +31,10 @@ const folders = [
   { id: 'f1', name: 'Kiro', icon: '🚀', order: 0, collapsed: false, project_dir: '/Volumes/workplace/KiroCrew' },
   { id: 'f1a', name: 'Backend', icon: '🧩', order: 0, collapsed: false, parent_id: 'f1' },
   { id: 'f2', name: 'Payments', icon: '🎯', order: 1, collapsed: true, project_dir: '/repo/payments', default_agent: 'kirocrew-dev' },
+  // f3's default agent is not in the stubbed roster (see stub-dashboard-api's
+  // /api/agents fixture), so its Folder settings render the orphan state: the
+  // "(not installed)" option label AND the inline notice bound to the field.
+  { id: 'f3', name: 'Retired', icon: '📦', order: 2, collapsed: true, project_dir: '/repo/retired', default_agent: 'retired-agent' },
 ]
 
 const slot = (key, title, folder_id, last_ts) => ({
@@ -103,6 +109,17 @@ async function main() {
   await page.click('[data-testid="folder-menu-f2"]')
   await page.click('[data-testid="folder-settings-f2"]')
   await shotModal(`${PREFIX}-04-edit-folder-settings`)
+  await closeModal()
+
+  // ── 05: edit a folder whose default agent is an orphan ──
+  // The Default agent field shows the "(not installed)" option and, below it,
+  // the inline notice bound to the control via aria-describedby — so the reason
+  // the selected agent won't run is announced WITH the field, not left floating.
+  await page.hover('[data-testid="folder-collapse-f3"]')
+  await page.click('[data-testid="folder-menu-f3"]')
+  await page.click('[data-testid="folder-settings-f3"]')
+  await page.waitForSelector('[data-testid="folder-config-agent-notice"]', { timeout: 5000 })
+  await shotModal(`${PREFIX}-05-edit-orphan-agent-notice`)
   await closeModal()
 
   await browser.close()
