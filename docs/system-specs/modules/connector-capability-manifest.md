@@ -288,12 +288,17 @@ changed and why:
    the provider streams *consume* — each family's contracts (e.g. `AUTH-01`
    through `AUTH-11`) are inputs a stream like `W02` or `W08` draws on, not
    streams themselves. An earlier revision assigned some of these family
-   names to stream slots (governance to `W03`, generic runtime to `W05`,
-   knowledge base to `W08`, ACL to `W09`, UX to `W10`, surfaces to `W11`,
-   product entry to `W14`, multi-account to `W13`). That assignment is
-   corrected here: `W02`–`W14` are provider or provider-group streams, full
-   stop, and a requirement family is referenced from inside a stream's own
-   dependency edges (see below), never given its own stream slot.
+   names to stream slots instead: governance to `W03`, generic runtime to
+   `W05`, knowledge base to `W08`, ACL to `W09`, UX to `W10`, surfaces to
+   `W11`, OPS to `W14`, and multi-account to `W13`. That assignment is
+   corrected here for every family it misplaced. `W14`'s own meaning —
+   product entry points — is not itself an error to correct: it is the
+   original contract's correct definition for that slot, and this section
+   preserves it; the error was OPS occupying that slot alongside it, not
+   `W14`'s definition. `W02`–`W14` are provider streams, provider-group
+   streams, or capability-delivery streams, full stop, and a requirement
+   family is referenced from inside a stream's own dependency edges (see
+   below), never given its own stream slot.
 2. **`W01` is a prerequisite, not a sibling.** An earlier revision drew `W00`
    branching directly to `W02` through `W14`, bypassing `W01`. That is
    corrected here: every provider stream depends on `W01` first. `W01`
