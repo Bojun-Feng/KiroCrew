@@ -5222,7 +5222,7 @@
         "detail_idle": "No se piden tareas",
         "detail_service": "Servicio",
         "detail_tasks": "{{running}} de {{desired}} tareas en ejecución",
-        "empty_body": "La pila base compartida está lista, así que esta cuenta puede alojar crews. Pide a tu crew que despliegue una y aparecerá aquí.",
+        "empty_body": "La pila base compartida está lista, así que esta cuenta puede alojar crews. Despliega una desde el chat y aparecerá aquí.",
         "empty_title": "Todavía no hay crews desplegadas",
         "fact_endpoint": "Punto de acceso",
         "fact_image": "Imagen",

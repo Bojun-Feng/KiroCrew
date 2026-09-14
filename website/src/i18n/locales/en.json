@@ -3887,7 +3887,7 @@
         "detail_idle": "No tasks asked for",
         "detail_service": "Service",
         "detail_tasks": "{{running}} of {{desired}} tasks running",
-        "empty_body": "The shared base is ready, so this account can host crews. Ask your crew to deploy one and it will show up here.",
+        "empty_body": "The shared base is ready, so this account can host crews. Use the chat to deploy one and it will show up here.",
         "empty_title": "No crews deployed yet",
         "fact_endpoint": "Endpoint",
         "fact_image": "Image",

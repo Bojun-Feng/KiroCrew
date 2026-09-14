@@ -935,17 +935,26 @@ async def _handle_crews(request: web.Request) -> web.Response:
     No consent gate. ``GATED_SERVICES`` exists ahead of the first BILLABLE call,
     and describe-stacks, describe-services and get-caller-identity are all free.
     Deploying a crew is emphatically not free (a Fargate task runs until it is
-    stopped, behind an ALB, egressing through a NAT), so the mutation that creates
-    one needs its own gated service. Listing what already exists does not, and
-    adding a card the owner must dismiss to read their own inventory would train
-    them to click through consent cards.
+    stopped, and its egress is billed), so the mutation that creates one needs its
+    own gated service. Listing what already exists does not, and adding a card the
+    owner must dismiss to read their own inventory would train them to click
+    through consent cards.
     """
     target = await _account_target(request)
     if isinstance(target, web.Response):
         return target
-    _account, profile, region = target
+    account, profile, region = target
     try:
-        inv = await asyncio.to_thread(crews_mod.list_crews, profile, region)
+        inv = await asyncio.to_thread(crews_mod.list_crews, profile, region, expect_account=account)
+    except crews_mod.ForeignAccount:
+        # 409 and the same code the pre-read probe uses, because it is the same
+        # answer: this connection is not serving the account that was asked for.
+        # A 502 would send the owner looking for an AWS outage.
+        return _conflict(
+            "this connection no longer points at the requested account — "
+            "refresh the accounts page",
+            "account_mismatch",
+        )
     except AWSError as exc:
         return _aws_failed(exc)
     except RuntimeError as exc:
@@ -958,10 +967,18 @@ async def _handle_crew_detail(request: web.Request) -> web.Response:
     target = await _account_target(request)
     if isinstance(target, web.Response):
         return target
-    _account, profile, region = target
+    account, profile, region = target
     name = request.match_info.get("crew", "")
     try:
-        found = await asyncio.to_thread(crews_mod.describe_crew, profile, region, crew=name)
+        found = await asyncio.to_thread(
+            crews_mod.describe_crew, profile, region, crew=name, expect_account=account
+        )
+    except crews_mod.ForeignAccount:
+        return _conflict(
+            "this connection no longer points at the requested account — "
+            "refresh the accounts page",
+            "account_mismatch",
+        )
     except AWSError as exc:
         return _aws_failed(exc)
     except RuntimeError as exc:

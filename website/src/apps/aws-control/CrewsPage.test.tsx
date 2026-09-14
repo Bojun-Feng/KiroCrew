@@ -28,7 +28,7 @@ import { screen, fireEvent, waitFor, within } from '@testing-library/react'
 
 import { renderWithProviders } from '../../test/helpers'
 import { i18nT } from '../../i18n/t'
-import type { CrewsResponse, RemoteCrew } from './types'
+import type { CrewMemoryMode, CrewsResponse, RemoteCrew } from './types'
 
 vi.mock('./api', async () => {
   const actual = await vi.importActual<typeof import('./api')>('./api')
@@ -93,6 +93,13 @@ describe('the three states that are not errors', () => {
 
     await waitFor(() => expect(screen.getByTestId('crews-base-missing')).toBeTruthy())
     expect(screen.getByText(i18nT('apps.awsControl.crews.base_missing_title'))).toBeTruthy()
+    // The empty state instructs but must not be a dead end: it carries the same
+    // agent hand-off the error notices on this pane do, so a reader with nothing
+    // to click here can still ask the agent about it.
+    expect(within(screen.getByTestId('crews-base-missing')).getByTestId('crews-base-missing-action'))
+      .toBeTruthy()
+    expect(screen.getByTestId('crews-base-missing-action'))
+      .toHaveTextContent(i18nT('components.askAgent.ask_the_agent'))
     // Emphatically NOT the empty-account state, and no error surface either.
     expect(screen.queryByTestId('crews-empty')).toBeNull()
     expect(screen.queryByTestId('crews-error')).toBeNull()
@@ -106,6 +113,13 @@ describe('the three states that are not errors', () => {
     await waitFor(() => expect(screen.getByTestId('crews-empty')).toBeTruthy())
     expect(screen.getByText(i18nT('apps.awsControl.crews.empty_title'))).toBeTruthy()
     expect(screen.queryByTestId('crews-base-missing')).toBeNull()
+    // Same hand-off affordance as the base-missing state: an empty state that only
+    // instructs, with nothing to click, is the UX finding this addresses.
+    expect(screen.getByTestId('crews-empty-action'))
+      .toHaveTextContent(i18nT('components.askAgent.ask_the_agent'))
+    // The reworded body names the chat, not "your crew" - the pane's own noun is
+    // "crews", so telling the reader to "ask your crew" collided with it.
+    expect(i18nT('apps.awsControl.crews.empty_body')).not.toContain('your crew')
     // The two empty states must not share a sentence - that is the whole point
     // of having two.
     expect(i18nT('apps.awsControl.crews.empty_title'))
@@ -130,6 +144,53 @@ describe('the three states that are not errors', () => {
     // "Unknown".
     const value = cell.querySelector('span')
     expect(value?.className).toContain('italic')
+  })
+
+  it('names ANY mode it does not recognise rather than rendering an empty cell', async () => {
+    // `CrewMemoryMode` is a closed union, so nothing in the type system produces
+    // these. A live stack does: a `Memory` parameter value added by a newer backend,
+    // or edited by hand, arrives here as a string this build was never taught. The
+    // map lookup then misses and `i18nT(undefined)` renders NOTHING, which on a
+    // deployment page is indistinguishable from a row that failed to load.
+    //
+    // This is a PROPERTY over the whole class of unrecognised values, not one pinned
+    // string: the defect the earlier capture harness had was exactly a check bound to
+    // a single instance (it clicked one crew id and so could never photograph a
+    // degraded state), so pinning `'ephemeral'` alone would leave a fallback keyed to
+    // that one word passing while every other unknown value still rendered blank.
+    const unknownModes = [
+      'ephemeral',
+      'hybrid',
+      'v2',
+      'RAM',
+      'a wholly novel mode',
+      'PERSISTENT ', // trailing space: not the known `persistent`, so still unknown
+      'Chatbot', // different case: not the known lowercase `chatbot`
+    ]
+    for (const mode of unknownModes) {
+      vi.clearAllMocks()
+      listMock().mockResolvedValue(
+        inventory({ crews: [crew({ name: 'future', memory: mode as CrewMemoryMode })] }),
+      )
+      const { unmount } = renderWithProviders(<CrewsPane account={ACCOUNT} />)
+
+      const cell = await waitFor(() => screen.getByTestId('crew-mode'))
+      // Every unrecognised value renders the SAME "Unknown", never blank.
+      expect(cell, `mode ${JSON.stringify(mode)} should render Unknown`)
+        .toHaveTextContent(i18nT('apps.awsControl.crews.mode_unknown'))
+      // Never the raw wire value: echoing it would present a word this build cannot
+      // define as though the page understood it.
+      expect(cell.textContent, `mode ${JSON.stringify(mode)} must not echo the wire value`)
+        .not.toContain(mode.trim())
+      // And never guessed as one of the two named modes.
+      expect(cell).not.toHaveTextContent(i18nT('apps.awsControl.crews.mode_chatbot'))
+      expect(cell).not.toHaveTextContent(i18nT('apps.awsControl.crews.mode_persistent'))
+      // Unknown is not data: italic and muted, so it cannot be misread as a real
+      // mode literally named "Unknown".
+      const value = cell.querySelector('span')
+      expect(value?.className, `mode ${JSON.stringify(mode)} should be italic`).toContain('italic')
+      unmount()
+    }
   })
 })
 
@@ -365,6 +426,27 @@ describe('opening a crew', () => {
     await waitFor(() => expect(screen.getByTestId('crew-detail-mode-why')).toBeTruthy())
     expect(screen.getByTestId('crew-detail-mode-value'))
       .toHaveTextContent(i18nT('apps.awsControl.crews.mode_unknown'))
+  })
+
+  it('withholds the explanation from a mode it merely cannot name', async () => {
+    // Both states read "Unknown", and only one of them has this reason. The
+    // sentence says the stack predates the parameter, which is true of an empty
+    // mode and false of a value this build cannot read: showing it there would
+    // answer WHY with something nothing established. Unknown may be reported; its
+    // cause may not be invented.
+    const future = crew({ name: 'future', memory: 'ephemeral' as CrewMemoryMode })
+    listMock().mockResolvedValue(inventory({ crews: [future] }))
+    detailMock().mockResolvedValue(crew({
+      name: 'future', memory: 'ephemeral' as CrewMemoryMode,
+      service: 'smc-future', running: 1, desired: 1,
+    }))
+    renderWithProviders(<CrewsPane account={ACCOUNT} />)
+
+    fireEvent.click(await waitFor(() => screen.getByTestId('crew-card')))
+    await waitFor(() => expect(screen.getByTestId('crew-detail-mode-value')).toBeTruthy())
+    expect(screen.getByTestId('crew-detail-mode-value'))
+      .toHaveTextContent(i18nT('apps.awsControl.crews.mode_unknown'))
+    expect(screen.queryByTestId('crew-detail-mode-why')).toBeNull()
   })
 
   it('says a crew has gone rather than reporting a failure to read it', async () => {

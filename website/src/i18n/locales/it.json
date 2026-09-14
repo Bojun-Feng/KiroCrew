@@ -5222,7 +5222,7 @@
         "detail_idle": "Nessun task richiesto",
         "detail_service": "Servizio",
         "detail_tasks": "{{running}} task su {{desired}} in esecuzione",
-        "empty_body": "Lo stack di base condiviso è pronto, quindi questo account può ospitare crew. Chiedi alla tua crew di distribuirne una e comparirà qui.",
+        "empty_body": "Lo stack di base condiviso è pronto, quindi questo account può ospitare crew. Avvia il deploy dalla chat e comparirà qui.",
         "empty_title": "Nessuna crew distribuita per ora",
         "fact_endpoint": "Endpoint",
         "fact_image": "Immagine",

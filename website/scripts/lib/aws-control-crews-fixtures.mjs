@@ -93,10 +93,38 @@ export const CREWS = {
   ],
 }
 
-export const DETAIL = listCrew('billing-help', {
-  memory: 'persistent',
-  service: 'smc-billing-help', running: 2, desired: 2,
-})
+/**
+ * The detail route answers per crew, DERIVED from the same list set above so the
+ * two evidence pieces cannot drift: whatever the grid shows for a crew, opening it
+ * shows the counts-carrying version of the SAME row. This is what makes the
+ * harnesses fixture-driven -- a detail state is captured because a crew in the
+ * fixtures produces it, not because a script hardcodes one crew id.
+ *
+ * The detail adds the two facts a list payload omits by design (`running`,
+ * `desired`) and picks them per crew so the pane's serving states each have a crew
+ * that produces them:
+ *   billing-help    serving       desired>0, running===desired -> green "Serving"
+ *   checkout-bot    not serving   desired>0, running<desired   -> red "Not serving"
+ *   legacy-triage   unknown+idle  memory==='' and desired===0   -> mode-why + idle line
+ *   the rest        serving       a settled healthy detail
+ *
+ * The `absent` state is the one detail state no crew's DATA can carry -- it is the
+ * ABSENCE of a crew (one that finished deleting between the grid and the click). It
+ * is driven by the `absent` fixture mode below, which 404s the detail regardless of
+ * which card was opened, the same way `mismatch` mode 409s it.
+ */
+const detailOver = {
+  'billing-help': { memory: 'persistent', service: 'smc-billing-help', running: 2, desired: 2 },
+  'checkout-bot': { stackStatus: 'UPDATE_IN_PROGRESS', service: 'smc-checkout-bot', running: 1, desired: 2 },
+  'legacy-triage': { memory: '', image: '', controlBase: '', service: '', running: 0, desired: 0 },
+}
+
+export const DETAILS = Object.fromEntries(
+  CREWS.crews.map((c) => [c.name, listCrew(c.name, { ...c, ...(detailOver[c.name] || { service: `smc-${c.name}`, running: 1, desired: 1 }) })]),
+)
+
+// Kept for callers that still open one crew directly; it is the serving state.
+export const DETAIL = DETAILS['billing-help']
 
 export const BASE = '/api/apps/aws-control'
 
@@ -184,7 +212,17 @@ export function createFixtureRouter() {
       return json(route, { service: 's3', granted: true, region: 'us-west-2', account: '111122223333' })
     }
     const app = path.startsWith(BASE) ? path.slice(BASE.length) : ''
-    if (/^\/crews\/[^/]+\/[^/]+$/.test(app)) return json(route, DETAIL)
+    const detail = app.match(/^\/crews\/[^/]+\/([^/]+)$/)
+    if (detail) {
+      // `absent` mode: the crew finished deleting between the grid and this
+      // click, so the detail 404s `crew_absent` whichever card was opened -- the
+      // same mode-switched shape `mismatch` uses. Otherwise the name in the URL
+      // selects the payload, so opening a crew shows ITS state.
+      if (mode === 'absent') return json(route, { error: 'no such crew in this account', code: 'crew_absent' }, 404)
+      const name = decodeURIComponent(detail[1])
+      if (name in DETAILS) return json(route, DETAILS[name])
+      return json(route, { error: 'no such crew in this account', code: 'crew_absent' }, 404)
+    }
     if (/^\/crews\/[^/]+$/.test(app)) {
       if (mode === 'base') return json(route, { ...CREWS, baseMissing: true, crews: [] })
       if (mode === 'empty') return json(route, { ...CREWS, crews: [] })

@@ -198,7 +198,46 @@ await page.waitForTimeout(500)
 await expectCount('crews-grid', 1)
 await expectCount('crew-detail', 0)
 
-// ---- the three non-error states ------------------------------------------
+// ---- the OTHER detail states, one still each -----------------------------
+// Fixture-driven: the crew name selects the payload (see DETAILS in the lib), so
+// this table names the state and the crew that produces it, and the harness opens
+// each and asserts the state-specific testid rendered before it saves the still.
+// Add a sixth data-carried state by adding a fixture entry + one row here -- the
+// open/assert/shot loop does not change. The `absent` state is the exception: it
+// is the ABSENCE of a crew, not a crew's data, so it is driven below by flipping
+// the fixture to `absent` mode rather than by a row in this table.
+const openCrew = async (name) => {
+  await reload('list')
+  await page.locator(`[data-testid="crew-card"][data-crew="${name}"]`).click()
+  await page.waitForTimeout(800)
+}
+for (const [crew, file, testid, note] of [
+  ['checkout-bot', 'crews-detail-not-serving', 'crew-detail-tasks', 'running<desired -> red Not serving badge'],
+  ['legacy-triage', 'crews-detail-unknown-idle', 'crew-detail-mode-why', "memory'' -> mode-why explanation + idle line"],
+]) {
+  await openCrew(crew)
+  await expectCount('crew-detail', 1)
+  await expectCount(testid, 1)
+  await page.screenshot({ path: `${OUT}/${file}.png`, fullPage: false })
+  console.log(`shot ${file} (${crew}: ${note})`)
+}
+// legacy-triage is BOTH unknown-mode and idle; assert the idle line is on that
+// same still rather than photographing a second crew for it.
+await expectCount('crew-detail-idle', 1)
+
+// A crew that finished deleting between the grid and the click: render the
+// populated grid, then flip the fixture to `absent` so the detail fetch 404s
+// crew_absent whichever card is opened. This is the mode-switched shape, so it
+// needs no extra crew in the grid and does not disturb the 5-card measurements.
+await reload('list')
+setMode('absent')
+await page.locator('[data-testid="crew-card"]').first().click()
+// The 404 goes through react-query's retry/backoff before it settles into the
+// error state, so wait for the notice itself rather than a fixed delay.
+await page.locator('[data-testid="crew-detail-absent"]').waitFor({ state: 'visible', timeout: 8000 })
+await expectCount('crew-detail-absent', 1)
+await page.screenshot({ path: `${OUT}/crews-detail-absent.png`, fullPage: false })
+console.log('shot crews-detail-absent (a crew missing from the account -> crew_absent)')
 await reload('base')
 await expectCount('crews-base-missing', 1)
 await expectCount('crews-empty', 0)

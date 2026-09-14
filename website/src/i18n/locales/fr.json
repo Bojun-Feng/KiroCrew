@@ -5222,7 +5222,7 @@
         "detail_idle": "Aucune tâche demandée",
         "detail_service": "Service",
         "detail_tasks": "{{running}} tâches sur {{desired}} en cours",
-        "empty_body": "La pile de base partagée est prête, ce compte peut donc héberger des crews. Demandez à votre crew d'en déployer une et elle apparaîtra ici.",
+        "empty_body": "La pile de base partagée est prête, ce compte peut donc héberger des crews. Déployez-en une depuis le chat et elle apparaîtra ici.",
         "empty_title": "Aucune crew déployée pour l'instant",
         "fact_endpoint": "Point d'accès",
         "fact_image": "Image",

@@ -5222,7 +5222,7 @@
         "detail_idle": "Nenhuma tarefa pedida",
         "detail_service": "Serviço",
         "detail_tasks": "{{running}} de {{desired}} tarefas em execução",
-        "empty_body": "A pilha base compartilhada está pronta, então esta conta pode hospedar crews. Peça à sua crew para implantar uma e ela aparecerá aqui.",
+        "empty_body": "A pilha base compartilhada está pronta, então esta conta pode hospedar crews. Faça o deploy pelo chat e ela aparecerá aqui.",
         "empty_title": "Nenhuma crew implantada ainda",
         "fact_endpoint": "Endpoint",
         "fact_image": "Imagem",

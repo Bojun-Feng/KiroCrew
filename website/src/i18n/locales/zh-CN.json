@@ -5058,7 +5058,7 @@
         "detail_idle": "未请求任何任务",
         "detail_service": "服务",
         "detail_tasks": "{{desired}} 个任务中有 {{running}} 个正在运行",
-        "empty_body": "共享的基础栈已就绪，此账户可以承载团队。让你的团队部署一个，它就会出现在这里。",
+        "empty_body": "共享的基础栈已就绪，此账户可以承载团队。在聊天中发起部署，它就会出现在这里。",
         "empty_title": "尚未部署任何团队",
         "fact_endpoint": "端点",
         "fact_image": "镜像",

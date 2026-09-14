@@ -5140,7 +5140,7 @@
         "detail_idle": "Keine Tasks angefordert",
         "detail_service": "Dienst",
         "detail_tasks": "{{running}} von {{desired}} Tasks laufen",
-        "empty_body": "Der gemeinsame Basis-Stack ist bereit, dieses Konto kann also Crews betreiben. Bitten Sie Ihre Crew, eine bereitzustellen, dann erscheint sie hier.",
+        "empty_body": "Der gemeinsame Basis-Stack ist bereit, dieses Konto kann also Crews betreiben. Starten Sie eine Bereitstellung im Chat, dann erscheint sie hier.",
         "empty_title": "Noch keine Crews bereitgestellt",
         "fact_endpoint": "Endpunkt",
         "fact_image": "Image",
