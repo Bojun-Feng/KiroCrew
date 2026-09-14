@@ -8925,61 +8925,53 @@ async def _live_slot_resume_response(
     return None
 
 
-# Bounds for the recursive structured-content redactor below. A row's
-# ``content`` is normally a string, but a legacy or hand-edited transcript can
-# carry a nested dict/list (multi-part content). We redact every string leaf
-# rather than skip such a row, but a corrupt or hostile row must not let the
-# walk run unbounded or blow the stack: _REDACT_MAX_DEPTH caps nesting and
-# _REDACT_MAX_NODES caps total visited nodes. Values: real multi-part content is
-# a shallow list of a handful of dicts (role/text/type parts), so depth 8 and
-# 10,000 nodes clear every legitimate shape by orders of magnitude while still
-# bounding an adversarial row to a fixed, cheap amount of work. On overflow the
-# offending subtree is dropped (replaced with ``None``) rather than emitted
-# unredacted or raised — dropping is fail-closed (no leak) and, per the resume
-# read-side contract, must never raise (a legacy row must not break resume).
-_REDACT_MAX_DEPTH = 8
-_REDACT_MAX_NODES = 10_000
+# Bound for normalising the non-string ``content`` a legacy or hand-edited
+# transcript row can carry (nested dict/list of multi-part content). We do NOT
+# redact-in-place and keep the structure: two independent problems make that
+# unsafe. (1) Redacting only string LEAVES leaves dict KEYS unscrubbed, so a
+# credential sitting in a key reaches the broadcaster. (2) The downstream
+# persistence/display paths (``_build_message_entry_uncached``, ``_prepare_messages``)
+# call the string-only redactors on ``content`` directly and raise ``TypeError``
+# on a non-string, so a structured row the slot accepted cannot be saved -- the
+# crash the parent revision had is only moved, not removed. Instead we NORMALISE
+# such content to a single JSON string and redact THAT, which scrubs keys and
+# values alike and yields a row every downstream path can serialise. Bounded so
+# a corrupt/hostile row cannot blow the stack: ``json.dumps`` with a depth-safe
+# default; on any failure we fall back to a fixed placeholder rather than raise.
+# Cap on the serialised size of a normalised structured-content row. A single
+# legitimate transcript row is far below this; a serialisation larger than the
+# transfer-bounds ceiling is a malformed/hostile row and is dropped to the
+# placeholder rather than run through the GIL-held redactors.
+_STRUCTURED_CONTENT_MAX_CHARS = 20_000_000
+_STRUCTURED_CONTENT_PLACEHOLDER = "[unsupported structured content removed]"
 
 
-def _redact_structured_content(value: object) -> object:
-    """Return a NEW value of the same shape with every string leaf redacted.
+def _normalise_structured_content(value: object) -> str:
+    """Return a redacted STRING for a non-string ``content`` value.
 
-    Handles the non-string ``content`` a legacy/corrupt transcript row can carry
-    (nested dict/list of multi-part content). Never mutates the input: dicts and
-    lists are rebuilt, so a caller holding the original (whose top level is only
-    shallow-copied by ``_redact_history_rows``) is not poisoned through a shared
-    nested container. Never raises and never stringifies — the shape is preserved
-    so the frontend renders it as before, only with credentials/exfil-URLs
-    scrubbed from the string leaves. Bounded by ``_REDACT_MAX_DEPTH`` /
-    ``_REDACT_MAX_NODES`` (see the module constants above); an overflowing
-    subtree is dropped to ``None`` rather than emitted unredacted.
+    Serialises the value to JSON (so nested dict keys AND values are captured as
+    text), then runs the same exfil-URL + credential redaction applied to a
+    plain string ``content``. Never raises and never returns a non-string: a
+    value that cannot be serialised (or is unexpectedly huge) collapses to a
+    fixed placeholder, which is fail-closed (no unredacted bytes escape) and
+    keeps the row serialisable by every downstream path.
     """
-    # Node budget is shared across the whole walk (not per-level), so a wide-but-
-    # shallow row is bounded too. A one-element list carries the counter by
-    # reference through the recursion.
-    budget = [_REDACT_MAX_NODES]
-
-    def _walk(v: object, depth: int) -> object:
-        if budget[0] <= 0 or depth > _REDACT_MAX_DEPTH:
-            # Fail closed: drop the subtree we cannot fully scan rather than pass
-            # it through unredacted.
-            return None
-        budget[0] -= 1
-        if isinstance(v, str):
-            v, _ = redact_exfiltration_urls(v)
-            v, _ = redact_credentials(v)
-            return v
-        if isinstance(v, dict):
-            return {k: _walk(item, depth + 1) for k, item in v.items()}
-        if isinstance(v, list):
-            return [_walk(item, depth + 1) for item in v]
-        if isinstance(v, tuple):
-            return tuple(_walk(item, depth + 1) for item in v)
-        # A non-container, non-string leaf (int/bool/None/float) carries no text
-        # to redact; return it unchanged.
-        return v
-
-    return _walk(value, 0)
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        # Must never raise: ``default=str`` invokes ``str()``/``__repr__`` on
+        # unknown objects, which a hostile/corrupt row can make raise anything
+        # (not just TypeError/ValueError). Any failure collapses to the
+        # placeholder -- fail-closed, no unredacted bytes escape.
+        return _STRUCTURED_CONTENT_PLACEHOLDER
+    # A pathologically large serialisation is dropped rather than run through the
+    # GIL-held redactors: the row is malformed either way, and a placeholder is
+    # the safe, cheap result.
+    if len(text) > _STRUCTURED_CONTENT_MAX_CHARS:
+        return _STRUCTURED_CONTENT_PLACEHOLDER
+    text, _ = redact_exfiltration_urls(text)
+    text, _ = redact_credentials(text)
+    return text
 
 
 def _redact_history_rows(rows: list[dict], *, window_limit: int | None = None) -> list[dict]:
@@ -9007,15 +8999,17 @@ def _redact_history_rows(rows: list[dict], *, window_limit: int | None = None) -
 
     User rows are left untouched (matching the write boundary, which redacts
     non-user text). A non-string ``content`` (legacy/corrupt JSONL, or nested
-    multi-part content) has its string leaves redacted in place-preserving shape
-    by ``_redact_structured_content`` rather than being passed through
-    unredacted: resume is reachable for such rows precisely because this pass is
-    defense-in-depth for transcripts a write-time rule never covered, so leaving
-    a non-string row unscrubbed would let a credential in nested content reach a
-    broadcaster. Row dicts in the redacted window are shallow-copied so the
-    caller's input is not mutated; the structured redactor rebuilds nested
-    containers, so no shared nested object is poisoned either. Prefix rows are
-    returned as-is.
+    multi-part content) is NORMALISED to a single redacted string by
+    ``_normalise_structured_content`` rather than being passed through
+    unredacted or kept as structure: resume is reachable for such rows precisely
+    because this pass is defense-in-depth for transcripts a write-time rule never
+    covered, so leaving a non-string row unscrubbed would let a credential in
+    nested content (a value OR a dict key) reach a broadcaster, and keeping the
+    structure would crash the downstream save/display paths that redact
+    ``content`` as a string. Row dicts in the redacted window are shallow-copied so the
+    caller's input is not mutated; a normalised structured row replaces only the
+    top-level ``content`` on the copy, so no shared nested object is touched
+    either. Prefix rows are returned as-is.
     """
     if window_limit is None or len(rows) <= window_limit:
         prefix: list[dict] = []
@@ -9032,9 +9026,13 @@ def _redact_history_rows(rows: list[dict], *, window_limit: int | None = None) -
                 content, _ = redact_credentials(content)
                 m = {**m, "content": content}
             else:
-                # Legacy/corrupt or nested multi-part content: redact its string
-                # leaves without stringifying or mutating the caller's object.
-                m = {**m, "content": _redact_structured_content(content)}
+                # Legacy/corrupt or nested multi-part content: normalise it to a
+                # single redacted STRING (scrubbing dict keys and values alike)
+                # rather than passing the structure through. Keeping the structure
+                # would (a) leave dict keys unredacted and (b) crash the downstream
+                # save/display paths, which call the string-only redactors on
+                # ``content``. See ``_normalise_structured_content``.
+                m = {**m, "content": _normalise_structured_content(content)}
         out.append(m)
     return out
 

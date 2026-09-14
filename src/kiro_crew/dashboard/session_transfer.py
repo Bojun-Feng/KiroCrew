@@ -82,15 +82,15 @@ from kiro_crew.agent_discovery import list_agents
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import kiro_sessions_dir
 
-# Layering: this module may import chat_handlers, never the reverse — its
-# consumers are handlers_instances (the tunnel) and session_export (the file
-# hop), neither of which chat_handlers' transitive graph reaches. If
-# chat_handlers ever needs session_transfer, move the shared collaborators down
-# to chat_persistence first rather than creating the cycle.
-from kiro_crew.dashboard.chat_handlers import (
-    _materialise_slot_from_history,
-    _redact_history_rows,
-)
+# Layering: chat_handlers' transitive import graph now reaches back into this
+# module (chat_handlers -> remote_adopt -> handlers_instances -> session_transfer),
+# so a MODULE-LEVEL import of chat_handlers here closes an import cycle: whichever
+# of the two loads first hits the other while it is still partially initialised.
+# The two symbols this module needs (``_materialise_slot_from_history`` and
+# ``_redact_history_rows``) are used only inside ``api_chat_slot_import``, so they
+# are imported FUNCTION-LOCALLY at the top of that handler instead. Keep it that
+# way: a module-level import reinstates the cycle. The proper long-term fix is to
+# move the shared collaborators down to chat_persistence, per the note there.
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop, session_was_deleted
 from kiro_crew.dashboard.chat_utils import (
     _sync_dashboard_slots,
@@ -1274,6 +1274,14 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
     imported slot deliberately has no project directory: the user picks one on
     arrival.
     """
+    # Imported function-locally, not at module level: chat_handlers' import graph
+    # reaches back here (see the layering note at the top of this module), so a
+    # module-level import would close an import cycle.
+    from kiro_crew.dashboard.chat_handlers import (
+        _materialise_slot_from_history,
+        _redact_history_rows,
+    )
+
     state: DashboardState = request.app["state"]
     request_app = request.get("app", "")
     caller = request_app or "dashboard"

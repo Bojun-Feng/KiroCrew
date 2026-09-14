@@ -1177,91 +1177,86 @@ def test_redact_history_rows_only_touches_the_window_not_the_frozen_prefix():
     assert all(secret not in m["content"] for m in out_all)
 
 
-def test_redact_history_rows_scrubs_string_leaves_of_structured_content():
+def test_redact_history_rows_normalises_structured_content_to_a_redacted_string():
     """A non-string ``content`` (nested multi-part content from a legacy or
-    hand-edited transcript) must have its string leaves redacted, not be passed
-    through unredacted.
+    hand-edited transcript) must be normalised to a redacted STRING, not passed
+    through unredacted and not kept as structure.
 
     Before this fix ``_redact_history_rows`` skipped any non-string ``content``
     (``if isinstance(content, str)``), so a credential nested in structured
-    content reached the broadcaster verbatim. This asserts a token-shaped string
-    buried in a dict/list ``content`` does NOT survive the redaction pass that
-    feeds ``_hydrate_slot_from_history`` (and thus the broadcaster). The shape is
-    preserved (still a list of dicts), not stringified, and the caller's original
-    nested object is not mutated.
+    content reached the broadcaster verbatim. Keeping the structure and redacting
+    only string leaves was also unsafe: a credential in a dict KEY would survive,
+    and the downstream save/display paths crash on non-string ``content``. So the
+    fix normalises to a single redacted string. This asserts a token-shaped
+    string buried in a dict/list ``content`` -- both as a value AND as a dict key
+    -- does NOT survive the redaction pass that feeds ``_hydrate_slot_from_history``
+    (and thus the broadcaster), that the result is a string, and that the row is
+    then serialisable by the persistence entry builder (bolin's ">200-row
+    saveable" requirement in miniature: the accepted row can be saved).
 
-    Negative-verified: revert ``_redact_structured_content`` to the old
-    passthrough (`else: pass`, keep the original ``content``) and this test fails
-    -- the token survives in the output.
+    Negative-verified: revert the ``else`` branch to the old passthrough
+    (``m = {**m, "content": content}`` keeping the original structure) and this
+    test fails -- the token survives and the content stays non-string.
     """
     from kiro_crew.dashboard.chat_handlers import _redact_history_rows
+    from kiro_crew.dashboard.chat_persistence import _build_message_entry_uncached
 
     secret = "ghp_" + "b" * 36  # token-shaped; the credential scanner redacts it
+    key_secret = "ghp_" + "d" * 36  # a credential sitting in a dict KEY
     nested = [
         {"type": "text", "text": f"leading {secret} trailing"},
         {"type": "text", "text": [f"deeper {secret}"]},  # list leaf, one level down
+        {key_secret: "value under a secret key"},  # credential as a dict key
     ]
     original = {"role": "assistant", "content": nested, "ts": ""}
     rows = [original]
 
     out = _redact_history_rows(rows, window_limit=None)
 
-    # The token is gone from every string leaf of the emitted content.
-    def _leaves(v):
-        if isinstance(v, str):
-            yield v
-        elif isinstance(v, dict):
-            for item in v.values():
-                yield from _leaves(item)
-        elif isinstance(v, (list, tuple)):
-            for item in v:
-                yield from _leaves(item)
-
-    assert all(secret not in leaf for leaf in _leaves(out[0]["content"]))
-    # Shape preserved: still a list of two dicts, not stringified.
-    assert isinstance(out[0]["content"], list) and len(out[0]["content"]) == 2
-    assert all(isinstance(part, dict) for part in out[0]["content"])
+    # Content is now a single string, and neither the value-token nor the
+    # key-token survives anywhere in it.
+    redacted = out[0]["content"]
+    assert isinstance(redacted, str)
+    assert secret not in redacted
+    assert key_secret not in redacted
     # The caller's original nested object was not mutated in place.
-    assert secret in original["content"][0]["text"]
+    assert original["content"] is nested and secret in nested[0]["text"]
+    # The accepted row is serialisable by the persistence path (which calls the
+    # string-only redactors on ``content`` and would TypeError on a non-string).
+    entry = _build_message_entry_uncached(out[0])
+    assert entry is not None and isinstance(entry["content"], str)
+    assert secret not in entry["content"] and key_secret not in entry["content"]
 
 
-def test_redact_structured_content_is_bounded_and_never_raises():
-    """The recursive redactor must not run unbounded or raise on a corrupt/
-    hostile row: over-deep nesting or too many nodes drops the offending subtree
-    (fail-closed) instead of leaking it or blowing the stack.
+def test_normalise_structured_content_is_bounded_and_never_raises():
+    """The normaliser must never raise and always return a string, even for a
+    corrupt/hostile row: an unserialisable value or a pathologically large one
+    collapses to a fixed placeholder (fail-closed) rather than leaking or
+    crashing.
     """
     from kiro_crew.dashboard.chat_handlers import (
-        _REDACT_MAX_DEPTH,
-        _redact_structured_content,
+        _STRUCTURED_CONTENT_PLACEHOLDER,
+        _normalise_structured_content,
     )
 
     secret = "ghp_" + "c" * 36
-    # Nest deeper than the depth cap: the over-deep leaf must be dropped, never
-    # emitted unredacted, and the walk must return (not raise / not recurse away).
-    deep = leaf = {}
-    for _ in range(_REDACT_MAX_DEPTH + 5):
-        child = {}
-        leaf["next"] = child
-        leaf = child
-    leaf["secret"] = secret
+    # A normal nested structure: serialised and redacted, token gone, is a string.
+    out = _normalise_structured_content([{"text": f"x {secret} y"}])
+    assert isinstance(out, str) and secret not in out
 
-    out = _redact_structured_content(deep)
+    # An unserialisable value (a set contains an object json cannot encode with
+    # default=str only for keys) -> a bare object is stringified via default=str,
+    # but a truly non-serialisable container falls back to the placeholder.
+    class _Boom:
+        def __repr__(self):
+            raise RuntimeError("nope")
 
-    def _all_strings(v):
-        if isinstance(v, str):
-            yield v
-        elif isinstance(v, dict):
-            for item in v.values():
-                yield from _all_strings(item)
-        elif isinstance(v, (list, tuple)):
-            for item in v:
-                yield from _all_strings(item)
+    out2 = _normalise_structured_content({"k": _Boom()})
+    assert out2 == _STRUCTURED_CONTENT_PLACEHOLDER
 
-    # The token, being past the depth cap, never appears in the output.
-    assert secret not in "".join(_all_strings(out))
-    # A plain non-container leaf is returned unchanged (nothing to redact).
-    assert _redact_structured_content(42) == 42
-    assert _redact_structured_content(None) is None
+    # A non-container leaf still comes back as a (redacted) string.
+    assert isinstance(_normalise_structured_content(42), str)
+    assert _normalise_structured_content(None) == "null"
 
 
 def test_named_create_on_a_retracted_under_construction_key_is_refused(tmp_path):
