@@ -58,16 +58,25 @@ not a preference:
   dispatching on `argv[0]` (`~/.toolbox/bin/kiro-cli` → `toolbox-exec`), a
   wrapper reading a sibling registry, or a self-updating install whose real
   payload lives beside it. The launch path is therefore the path the caller
-  resolved, **not** its realpath. One exception, a pod child only: its remapped
-  `$HOME` puts the sibling nowhere, so `apply_pod_bundle_spawn` resolves a
-  symlinked `argv[0]` **onto a verified `<name>.app/Contents/MacOS/` target only** —
-  same basename, executable, with a `<basename>-` sibling beside it. Verifying the
-  whole layout, not just that the link resolves, is what keeps the exception off
-  the `argv[0]`-dispatching multiplexer above and off any wrapper that finds its
-  resources through the path it was invoked by. Crew's launcher still takes the
-  sandbox, though not for the bundle swap's reason: no shim is in this chain, and
-  delegating would skip Crew's seatbelt for an internal sandbox whose behaviour
-  under the pod's remapped `$HOME` Crew cannot verify.
+  resolved, **not** its realpath. Two narrow exceptions select another executable
+  in place rather than copying bytes:
+  - A pod child whose remapped `$HOME` puts the sibling nowhere may have
+    `apply_pod_bundle_spawn` resolve a symlinked `argv[0]` **onto a verified
+    `<name>.app/Contents/MacOS/` target only**: same basename, executable, with a
+    `<basename>-` sibling beside it. Verifying the whole layout keeps this off the
+    `argv[0]`-dispatching multiplexer above. Crew's launcher takes the sandbox.
+  - A Kiro host process may set `agent.acp_bypass_launcher_shim=true`. At that
+    process's spawn boundary, `apply_host_launcher_shim_bypass` uses
+    `_kiro_cli_bundle_binary`, the toolbox shim's own fallback algorithm, to
+    select the executable bundle. No arbitrary realpath qualifies. The critical
+    SEL audit lands before substitution; an audit failure keeps the launcher.
+    A successful substitution disables internal-sandbox delegation and forces
+    Kiro Crew's outer sandbox request back to `auto` when it was `off`. Windows
+    keeps the launcher and internal-sandbox delegation even when the flag is
+    true, because Kiro Crew has no native outer sandbox there and bypassing the
+    launcher would remove the only Kiro confinement layer. The default is false,
+    non-Kiro backends and pod children do not enter this path, and a path with no
+    executable bundle candidate stays byte-identical.
 
 **Removed: the resolve-to-exec integrity snapshot.** An earlier design copied the
 resolved bytes into a private location and executed that instead — a sealed
@@ -557,6 +566,16 @@ Subprocess lifecycle:
 - **Sandbox ownership**: `_spawn()` calls `sandbox.wrap_argv()` to wrap the command with platform-native isolation (Linux: two-stage `unshare -rm` → `unshare -U` bind-mounts + UID drop; macOS: `sandbox-exec` Seatbelt profile). On Windows, where Kiro Crew has no native OS wrapper, an explicitly classified official Kiro backend delegates to Kiro CLI's built-in sandbox; every other backend retains the no-backend fail-closed policy. The parent passes a fully scrubbed child environment on every platform, which is the enforcement point for raw Windows delegation. Configurable via `sandbox_mode` constructor param (`"auto"` default, `"off"` to disable). See `docs/system-specs/modules/security.md`.
 - **Parent-level channel-credential scrub**: both spawn paths (`AcpClient._spawn` and `AcpRuntime._spawn`) build the child environment from a raw `os.environ` copy (plus `_extra_env`) and pass it directly to `create_subprocess_exec`, so they call `sandbox.scrub_agent_denied_env(env)` after merging `_extra_env` to strip `_AGENT_DENIED_ENV_KEYS` (Slack/WeCom/Telegram tokens + owner id seeded into `os.environ` by `config.loader.load_credentials`). This is required because these paths do NOT route through `sandboxed_spawn_argv`, and the OS-sandbox launcher only strips those keys for the `cc`/`strict` tiers — on the default `auto`/`standard` tier the launcher leaves them in place, so without the parent scrub they would be inherited by the agent subprocess. The scrub is deliberately narrower than `scrub_env`: it leaves the AWS/SSH env the `standard` sandbox intentionally exposes (git-over-SSH, AWS CLI, kubectl) untouched. One credential is settled per-backend rather than by the deny list: `KIRO_API_KEY` (kiro-cli's own model credential, in `CREDENTIAL_KEYS` but deliberately NOT in `_AGENT_DENIED_ENV_KEYS`) is re-injected from the data home's `.env` via `config.loader.inject_kiro_cli_api_key` for a kiro-cli child (whose environment is where the CLI reads it — required after the Docker entrypoint scrubs it from the gateway's environ) and actively stripped via `strip_kiro_cli_api_key` for a foreign backend (Claude seam, KAS), which must never receive it; both run inside the spawn paths' existing off-loop env hop.
 - `_resolve_kiro_bin()` delegates to the side-effect-free `kiro_cli.resolve_kiro_cli()` discovery module shared with first-run setup. It checks the explicit `KIROCREW_KIRO_BIN` operator/test override first, then the supported fixed install locations and augmented PATH; setup status may inspect the same candidates but never mutates the override or other process-global environment. The gateway's prerequisite service and the direct `chat`/`tui`/`run`/`consolidate`/`eval` CLI entry paths both register the override's canonical path and first-observed digest before any provider can be created; process-lifetime first-observation-wins semantics prevent a later service reconstruction from blessing replacement bytes. `runtime.py` imports and reuses the ACP wrapper so both ACP transports select the binary identically. Immediately before OS sandboxing, `sandbox.py` routes argv[0] through the edition-neutral `PlatformContext.agent_executable` resolver; the public Default is identity and a companion can return a direct executable behind an edition-managed launcher without changing the core.
+  `KIROCREW_KIRO_BIN` remains the first discovery decision when the host bypass
+  is enabled. Pointing it at a direct executable leaves that executable unchanged;
+  pointing it at the stable toolbox shim lets the opt-in follow the shim's symlink
+  chain to the current bundle. Pinning a versioned toolbox bundle path directly
+  also works but goes stale on the next toolbox update, which is why stable
+  launcher discovery plus per-spawn bundle resolution is the durable form.
+  The host opt-in runs before `wrap_argv`; the platform resolver then receives
+  the selected bundle and still resolves it inside the same outer sandbox. This
+  keeps `DefaultAgentExecutableResolver` identity-only. Core host policy is not
+  encoded as an edition override.
 - The dashboard `/api/models` one-shot subprocess validates completion before parsing stdout: nonzero exit (with a bounded, redacted stderr tail), empty stdout, malformed JSON, or a payload without a model list each returns HTTP 503 so the client retries. A subprocess failure is never misreported as `JSONDecodeError` or cached as a successful empty model list. Before the spawn, it uses `config.loader.inject_kiro_cli_api_key` off-loop just like the interactive Kiro ACP path, so a headless Docker gateway whose entrypoint moved `KIRO_API_KEY` out of the long-lived parent environment still authenticates this official fixed-argv `kiro-cli` read; the general child-environment scrub remains unchanged.
 - **One-shot `kiro-cli` reads spawn at the CONFIGURED sandbox tier**, via `sandbox.configured_sandbox_mode()` (`agent.sandbox`, falling back to `"auto"` and warning when the config cannot be read — an unreadable config must not yield a looser tier). The affected sites are `/api/models` (`--list-models`), and in `handlers/sessions.py` the `whoami` identity fetch and the `/usage` text scrape. On Windows all three pass `is_kiro_cli=True`, so a default `"auto"` install delegates to Kiro's built-in sandbox exactly like interactive chat and needs no broad unsandboxed-exec opt-in. They also pass `scrub_agent_subprocess_env()` as the explicit child environment. The configured-tier seam still matters for an explicit `agent.sandbox="off"` and for platforms with a Crew backend: a one-shot read must not silently request a stricter posture than the same long-lived Kiro binary. Use `configured_sandbox_mode()` for a spawn of the same binary under the same posture as chat — **not** for spawns that deliberately pin their own tier (the prerequisite probes' `strict`, the credential-free registry clones). Governance still clamps the result up via `_clamp_sandbox_mode`, so a `sandbox.min_level` floor overrides it like any other caller-supplied mode.
   - **Accepted trade on the two `sessions.py` sites**, stated explicitly because it is a real (small) loosening on hosts that *do* have a backend: they previously pinned `"standard"`, so on Linux with an explicitly configured `agent.sandbox="off"` they now spawn with no Kiro Crew wrap where they used to hide `_STANDARD_DIRS` (`.gnupg`, `.config/gcloud`, `.azure`, `.docker`, the auth-staging dir). This is deliberate and is the *same* posture the interactive chat spawn of that identical binary already runs under on that identical host — a one-shot `whoami` cannot need stricter confinement than the long-lived chat session, and the previous asymmetry was an accident of a hardcoded literal, not a designed boundary. Both spawns are fixed argv with no agent-influenced arguments, `kiro-cli`'s own internal sandbox is the layer `"off"` defers to, and and an operator who wants the wrap back sets `agent.sandbox="auto"` — the shipped default — which then applies uniformly to chat *and* these reads instead of only to these reads. The narrowness matters: this loosening is reachable only on a host where the operator has *already* declared `"off"` and thereby accepted that posture for every chat turn, which is a far larger and longer-lived exposure than one `whoami`.

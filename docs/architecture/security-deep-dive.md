@@ -148,10 +148,27 @@ Two properties are load-bearing at the architecture level:
 
 **Launcher shims are deliberately not bypassed on the delegated path.** On that
 path the shim is part of `kiro-cli`'s own sandbox mechanism, so resolving past it
-would defeat the delegated layer. Where an edition needs a managed launcher
-replaced with the executable it ultimately invokes, that goes through the
-`PlatformContext.agent_executable` resolver, whose result is always placed
-*inside* the same namespace/Seatbelt wrapper. The capability probe never runs an
+would defeat the delegated layer. The default keeps this behavior byte-identical.
+
+`agent.acp_bypass_launcher_shim=true` is one explicit host-session exception for
+the Kiro backend. It resolves only a toolbox launcher shape supported by the
+shim's own bundle fallback. The bypass is audit-or-deny: a critical SEL event
+must land before argv changes, and a failure leaves the launcher and delegation
+intact. A successful bypass sets internal-sandbox delegation false and requests
+Kiro Crew's outer sandbox even when `agent.sandbox` was `off`. It also logs the
+posture once per process. The operator trades away the launcher's own sandbox
+and its credential brokering; Kiro Crew's namespace or Seatbelt layer, parent
+environment scrub, tool gate, and output redaction remain. Windows keeps the
+launcher and Kiro's internal-sandbox delegation even when the flag is true:
+Kiro Crew has no native outer sandbox there, so a bypass would remove the only
+Kiro confinement layer. Pod children keep their separate existing rule, and
+non-Kiro backends never inherit the exception.
+
+An edition-managed launcher remains a different concern. It goes through the
+`PlatformContext.agent_executable` resolver, whose result is always placed inside
+the same namespace or Seatbelt wrapper. The public Default stays identity-only:
+the core host opt-in selects its bundle before `wrap_argv`, then the resolver sees
+that selected executable inside the wrapper. The capability probe never runs an
 edition-resolved or user-writable target; it runs a fixed trusted system binary.
 
 ### Why the default is defensible

@@ -474,7 +474,14 @@ Wired sites:
   executable behind an edition-managed launcher to avoid nested isolation, but
   cannot disable or weaken the outer sandbox. A transient adapter error falls
   back to the original executable (outer sandbox still applies); a
-  `PlatformCompositionError` propagates fail-closed.
+  `PlatformCompositionError` propagates fail-closed. The core host-session
+  `agent.acp_bypass_launcher_shim` policy runs earlier in ACP spawn preparation
+  on hosts where Kiro Crew can provide the outer sandbox: it selects the toolbox
+  bundle and forces the outer wrapper, then this resolver sees that selected
+  executable. Windows preserves the launcher and Kiro delegation because this
+  core has no native outer wrapper there. Keeping the two stages separate leaves
+  the public Default identity-only and prevents a core config flag from becoming
+  an edition-specific resolver behavior.
 - `hooks.py` — the deny check routes through `current_context().security.is_denied`;
   the kiro-hooks egress (`dashboard/handlers/hooks.py`) scrubs command/matcher
   through the shared `redact_via_context` shim.

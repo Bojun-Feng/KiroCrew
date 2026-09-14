@@ -1488,6 +1488,22 @@ resume a stale session persisted under the other namespace. The schema is the
 source of truth for this list: `requires_restart()` over `SCHEMA_REGISTRY`
 answers it, and this prose is a reader's convenience.
 
+**`agent.acp_bypass_launcher_shim` is a spawn-time read.** It is not
+`restart=True` and has no watcher applier. Both ACP transports call the shared
+host-bypass helper in their existing off-loop spawn preparation, and that helper
+loads the current config at the point of use. A write therefore leaves every
+running ACP process unchanged and applies to the next newly spawned Kiro host
+process without a gateway restart. This is the point-of-use arm of the review
+checklist above, not a promise to rewrite a live process.
+
+The boolean defaults false and malformed values also resolve false. A true value
+is a security posture change: it bypasses the toolbox launcher sandbox and its
+credential brokering, requires a critical SEL audit before substitution, disables
+internal-sandbox delegation, and requests Kiro Crew's outer sandbox. The warning
+is logged once per process. Windows does not consume the bypass because Kiro Crew
+has no native outer sandbox there; it preserves the launcher and Kiro delegation.
+Pod children and non-Kiro backends do not consume it.
+
 ### Which write paths kick the watcher
 
 Every door onto `config.json` ends at `notify_config_written()`, so the dashboard,
@@ -1547,6 +1563,7 @@ class AgentConfig:
     streaming: bool = True
     model: str = "auto"            # resolved from agent config
     provider: str = "acp"          # fixed to "acp" (kiro-cli) — the only provider
+    acp_bypass_launcher_shim: bool = False  # host Kiro opt-in; read per ACP process spawn
     sandbox: str = "auto"          # default "auto" (namespace on Linux, seatbelt on macOS; delegates to kiro-cli's internal sandbox on macOS when enabled); "off" skips Kiro Crew's sandbox
     sandbox_allow_no_isolation: bool = False  # SEC-009: acknowledge running un-isolated when no sandbox backend exists; false = loud SECURITY warning, true = info-level
     soft_stop_budget_secs: float = 10.0  # seconds to wait for cooperative cancel before hard kill [0.5, 60.0]

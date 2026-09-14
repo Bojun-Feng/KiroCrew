@@ -924,6 +924,21 @@ class AgentConfig:
             # renders. See harness-parity H4.
         ),
     )
+    acp_bypass_launcher_shim: bool = field(
+        default=False,
+        metadata=_meta(
+            "Bypass ACP launcher shim",
+            "Explicit host-session opt-in. When true, new Kiro ACP processes "
+            "resolve a toolbox kiro-cli launcher shim to its bundle binary, "
+            "disable internal-sandbox delegation for that spawn, and keep Kiro "
+            "Crew's OS sandbox active. This removes the launcher's own sandbox "
+            "and credential-brokering layer. Default false preserves argv and "
+            "delegation byte-for-byte. The value is read at each process spawn: "
+            "existing sessions keep their process, while the next new process "
+            "uses the current value without a gateway restart. Pod children use "
+            "their separate bundle-spawn rule.",
+        ),
+    )
     member_acp_backend: str = field(
         default="kas",
         metadata=_meta(

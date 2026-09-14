@@ -28,6 +28,7 @@ import stat
 import subprocess as subprocess_mod
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections import deque
@@ -1437,6 +1438,123 @@ def apply_pod_bundle_spawn(
     if bundle is None:
         return argv, delegate
     return [bundle, *argv[1:]], False
+
+
+_HOST_LAUNCHER_SHIM_BYPASS_LOG_LOCK = threading.Lock()
+_host_launcher_shim_bypass_logged = False
+
+
+def _host_launcher_shim_bypass_enabled() -> bool:
+    """Read the host-session launcher-shim opt-in for this process spawn.
+
+    The read happens at the spawn boundary, off the event loop through the caller's
+    ``asyncio.to_thread`` hop. Existing ACP processes keep their launch choice; a
+    config change applies to the next process without rebuilding the provider factory.
+    Any config failure leaves the launcher in place, the fail-closed direction.
+    """
+    try:
+        # Lazy import: config.loader imports the provider and ACP client while it
+        # builds the factory, so a module-level import would close that cycle.
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        return KiroCrewConfig.load().agent.acp_bypass_launcher_shim is True
+    except Exception:
+        logger.warning(
+            "Could not read %s; keeping the kiro-cli launcher shim",
+            "agent.acp_bypass_launcher_shim",
+            exc_info=True,
+        )
+        return False
+
+
+def _log_host_launcher_shim_bypass_once() -> None:
+    """Expose the launcher security trade once per gateway process."""
+    global _host_launcher_shim_bypass_logged
+    with _HOST_LAUNCHER_SHIM_BYPASS_LOG_LOCK:
+        if _host_launcher_shim_bypass_logged:
+            return
+        _host_launcher_shim_bypass_logged = True
+    logger.warning(
+        "SECURITY: agent.acp_bypass_launcher_shim is enabled. Kiro host "
+        "sessions run the kiro-cli bundle binary inside Kiro Crew's OS sandbox "
+        "instead of the launcher shim; the launcher's sandbox and credential "
+        "brokering do not run."
+    )
+
+
+def apply_host_launcher_shim_bypass(
+    argv: list[str],
+    *,
+    backend: str,
+    delegate_internal_sandbox: bool,
+    bypass_launcher_shim: bool | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[list[str], bool, bool]:
+    """Apply the explicit host-session toolbox launcher-shim bypass.
+
+    Returns ``(argv, delegate_internal_sandbox, force_outer_sandbox)``. The
+    third value tells the ACP spawn to request Kiro Crew's ``auto`` sandbox when
+    the operator otherwise configured ``agent.sandbox=off``. Resolving past the
+    launcher and delegating to that launcher's internal sandbox are mutually
+    exclusive decisions.
+
+    The default path is byte-identical: a disabled flag, a non-Kiro backend, a
+    pod child, a Windows host, or a path with no verified bundle candidate
+    returns every input unchanged. Windows keeps the launcher because Kiro Crew
+    has no native outer sandbox there; bypassing it would disable the only
+    available Kiro confinement layer. Pod children retain
+    :func:`apply_pod_bundle_spawn` as their sole policy. The Kiro test is a
+    positive equality (harness-parity H5/H7).
+
+    The bypass is audit-or-deny. The critical SEL write happens before argv is
+    changed. If it fails, this function keeps the launcher and its original
+    delegation decision, so no unaudited bypass reaches the subprocess call.
+    """
+    env = os.environ if environ is None else environ
+    if env.get("KIROCREW_POD") == "1":
+        return argv, delegate_internal_sandbox, False
+
+    # Windows has no Kiro Crew outer sandbox. Its reviewed Kiro path relies on
+    # the launcher's internal sandbox, so resolving past the launcher while also
+    # disabling delegation would leave the bundle process unconfined.
+    if sys.platform == "win32":
+        return argv, delegate_internal_sandbox, False
+
+    enabled = bypass_launcher_shim
+    if enabled is None:
+        enabled = _host_launcher_shim_bypass_enabled()
+
+    if backend == ACP_BACKEND_KIRO and enabled is True and argv:
+        bundle = _kiro_cli_bundle_binary(argv[0], environ=env)
+        if bundle is None:
+            return argv, delegate_internal_sandbox, False
+        try:
+            sel_module.sel().log_tool_invocation(
+                session_key="sandbox",
+                agent="system",
+                source="acp.client",
+                tool_name="kiro-cli launcher shim bypass",
+                tool_kind="subprocess",
+                outcome="bypassed",
+                resources="toolbox launcher shim replaced by bundle binary",
+                metadata={
+                    "reason": "configured_host_launcher_shim_bypass",
+                    "config": "agent.acp_bypass_launcher_shim",
+                    "outer_sandbox_required": True,
+                },
+                critical=True,
+            )
+        except Exception:
+            logger.warning(
+                "SEL audit failed for the configured host launcher-shim "
+                "bypass; keeping the launcher shim and its sandbox delegation",
+                exc_info=True,
+            )
+            return argv, delegate_internal_sandbox, False
+        _log_host_launcher_shim_bypass_once()
+        return [bundle, *argv[1:]], False, True
+
+    return argv, delegate_internal_sandbox, False
 
 
 # Subprocess stdout buffer — kiro-cli can send large JSON-RPC lines (tool outputs)
@@ -6368,6 +6486,19 @@ class AcpClient:
         argv, delegate_internal_sandbox = await asyncio.to_thread(
             apply_pod_bundle_spawn, argv, backend=self.backend
         )
+        # A host opt-in may resolve the toolbox launcher shim to its bundle
+        # binary. It is a separate decision from the pod rule above, and it is
+        # read at this spawn boundary so a newly-created process sees current
+        # config. The critical SEL audit lands before either output changes.
+        argv, delegate_internal_sandbox, force_outer_sandbox = await asyncio.to_thread(
+            apply_host_launcher_shim_bypass,
+            argv,
+            backend=self.backend,
+            delegate_internal_sandbox=delegate_internal_sandbox,
+        )
+        sandbox_mode = self._sandbox_mode
+        if force_outer_sandbox and sandbox_mode == "off":
+            sandbox_mode = "auto"
         private_kwargs: dict[str, Any] = (
             {
                 "private_memory": True,
@@ -6383,7 +6514,7 @@ class AcpClient:
         )
         argv, self._sandbox_cleanup = await wrap_argv_async(
             argv,
-            mode=self._sandbox_mode,
+            mode=sandbox_mode,
             strip_python_env=True,
             # Credential homes the standard tier exposes for kiro-cli's sake and
             # that an enforced adapter has no claim on. Empty for every harness

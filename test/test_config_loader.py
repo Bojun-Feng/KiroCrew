@@ -305,6 +305,17 @@ def test_sandbox_allow_unsandboxed_exec_loads_from_config() -> None:
     assert enabled.agent.sandbox_allow_unsandboxed_exec is True
 
 
+def test_acp_bypass_launcher_shim_loads_and_round_trips() -> None:
+    assert KiroCrewConfig().agent.acp_bypass_launcher_shim is False
+    assert _load_from_dict({}).agent.acp_bypass_launcher_shim is False
+    enabled = _load_from_dict({"agent": {"acp_bypass_launcher_shim": True}})
+    assert enabled.agent.acp_bypass_launcher_shim is True
+    assert _load_from_dict(enabled.to_dict()).agent.acp_bypass_launcher_shim is True
+
+    malformed = _load_from_dict({"agent": {"acp_bypass_launcher_shim": "true"}})
+    assert malformed.agent.acp_bypass_launcher_shim is False
+
+
 def test_max_stop_hook_nudges_loads_from_config_and_round_trips() -> None:
     """The Stop-hook nudge cap is built field-by-field in load(), so an
     operator's value must hydrate and survive a to_dict() -> load() round-trip.

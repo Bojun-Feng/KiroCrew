@@ -49,6 +49,7 @@ from kiro_crew.acp.client import (
     _drain_oversize_line,
     _get_start_time,
     _KiroExecutableTrustError,
+    apply_host_launcher_shim_bypass,
     apply_pod_bundle_spawn,
     finish_suspended_spawn,
     is_auth_failure_output,
@@ -1413,6 +1414,18 @@ class AcpRuntime:
         argv, delegate_internal_sandbox = await asyncio.to_thread(
             apply_pod_bundle_spawn, argv, backend=self._acp_backend
         )
+        # Host sessions read the explicit launcher-shim bypass at the process
+        # spawn boundary. Pod children returned above keep their own unchanged
+        # policy, and the helper's critical audit precedes any host substitution.
+        argv, delegate_internal_sandbox, force_outer_sandbox = await asyncio.to_thread(
+            apply_host_launcher_shim_bypass,
+            argv,
+            backend=self._acp_backend,
+            delegate_internal_sandbox=delegate_internal_sandbox,
+        )
+        sandbox_mode = self._sandbox_mode
+        if force_outer_sandbox and sandbox_mode == "off":
+            sandbox_mode = "auto"
         private_kwargs: dict[str, Any] = (
             {
                 "private_memory": True,
@@ -1436,7 +1449,7 @@ class AcpRuntime:
         # make the mask disappear whenever private memory is off.
         argv, self._sandbox_cleanup = await wrap_argv_async(
             argv,
-            mode=self._sandbox_mode,
+            mode=sandbox_mode,
             strip_python_env=True,
             is_kiro_cli=delegate_internal_sandbox,
             extra_hidden_dirs=plan.extra_hidden_dirs,

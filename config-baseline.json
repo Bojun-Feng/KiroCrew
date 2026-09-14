@@ -25,6 +25,7 @@
         "mcp_registry_mode": false,
         "mcp_quarantine_after_failures": 3,
         "acp_backend": "",
+        "acp_bypass_launcher_shim": false,
         "member_acp_backend": "kas",
         "default_agent": "",
         "sweep_agents_backups": false,
@@ -274,6 +275,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
+    },
+    {
+      "path": "agent.acp_bypass_launcher_shim",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Bypass ACP launcher shim",
+      "help": "Explicit host-session opt-in. When true, new Kiro ACP processes resolve a toolbox kiro-cli launcher shim to its bundle binary, disable internal-sandbox delegation for that spawn, and keep Kiro Crew's OS sandbox active. This removes the launcher's own sandbox and credential-brokering layer. Default false preserves argv and delegation byte-for-byte. The value is read at each process spawn: existing sessions keep their process, while the next new process uses the current value without a gateway restart. Pod children use their separate bundle-spawn rule.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "agent.member_acp_backend",

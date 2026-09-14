@@ -3354,6 +3354,9 @@ class KiroCrewConfig:
                     agent_data.get("mcp_quarantine_after_failures", 3), 3
                 ),
                 acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),
+                acp_bypass_launcher_shim=_safe_bool(
+                    agent_data.get("acp_bypass_launcher_shim", False), False
+                ),
                 member_acp_backend=_normalize_acp_backend(
                     agent_data.get("member_acp_backend", "kas")
                 ),

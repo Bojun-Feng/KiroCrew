@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from conftest import requires_symlinks
+from kiro_crew.acp import client as acp_client
 from kiro_crew.acp.client import (
     _kiro_cli_bundle_binary,
+    apply_host_launcher_shim_bypass,
     apply_pod_bundle_spawn,
 )
 from kiro_crew.acp_backends import (
@@ -255,6 +258,166 @@ def test_a_harness_outside_the_remap_set_is_untouched_inside_a_pod(tmp_path: Pat
     )
     assert argv == original
     assert delegate is (other in ACP_BACKENDS_INTERNAL_SANDBOX)
+
+
+# ── The explicit host opt-in ──────────────────────────────────────────────────
+
+
+def _mock_sel(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    audit = MagicMock()
+    monkeypatch.setattr(acp_client.sel_module, "sel", lambda: audit)
+    return audit
+
+
+def test_host_flag_off_keeps_argv_and_delegation_byte_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shim, _bundle = _bundle_layout(tmp_path)
+    original = [shim, "acp", "--agent", "kirocrew"]
+    audit = _mock_sel(monkeypatch)
+
+    argv, delegate, force_outer = apply_host_launcher_shim_bypass(
+        list(original),
+        backend=ACP_BACKEND_KIRO,
+        delegate_internal_sandbox=True,
+        bypass_launcher_shim=False,
+        environ={},
+    )
+
+    assert argv == original
+    assert delegate is True
+    assert force_outer is False
+    audit.log_tool_invocation.assert_not_called()
+
+
+def test_host_flag_on_keeps_windows_launcher_and_internal_delegation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows has no Kiro Crew outer sandbox to replace launcher delegation."""
+    shim, _bundle = _bundle_layout(tmp_path)
+    original = [shim, "acp", "--agent", "kirocrew"]
+    audit = _mock_sel(monkeypatch)
+    monkeypatch.setattr(acp_client.sys, "platform", "win32")
+
+    result = apply_host_launcher_shim_bypass(
+        list(original),
+        backend=ACP_BACKEND_KIRO,
+        delegate_internal_sandbox=True,
+        bypass_launcher_shim=True,
+        environ={},
+    )
+
+    assert result == (original, True, False)
+    audit.log_tool_invocation.assert_not_called()
+
+
+def test_host_flag_on_swaps_shim_and_refuses_internal_delegation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shim, bundle = _bundle_layout(tmp_path)
+    audit = _mock_sel(monkeypatch)
+
+    argv, delegate, force_outer = apply_host_launcher_shim_bypass(
+        [shim, "acp", "--agent", "kirocrew"],
+        backend=ACP_BACKEND_KIRO,
+        delegate_internal_sandbox=True,
+        bypass_launcher_shim=True,
+        environ={},
+    )
+
+    assert argv == [bundle, "acp", "--agent", "kirocrew"]
+    assert delegate is False
+    assert force_outer is True
+    audit.log_tool_invocation.assert_called_once()
+    kwargs = audit.log_tool_invocation.call_args.kwargs
+    assert kwargs["outcome"] == "bypassed"
+    assert kwargs["critical"] is True
+    assert kwargs["metadata"]["config"] == "agent.acp_bypass_launcher_shim"
+
+
+def test_host_flag_on_without_a_shim_chain_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    direct = tmp_path / "bin" / "kiro-cli"
+    direct.parent.mkdir(parents=True)
+    direct.write_text("#!/bin/sh\nexit 0\n")
+    direct.chmod(0o755)
+    original = [str(direct), "acp"]
+    audit = _mock_sel(monkeypatch)
+
+    result = apply_host_launcher_shim_bypass(
+        list(original),
+        backend=ACP_BACKEND_KIRO,
+        delegate_internal_sandbox=True,
+        bypass_launcher_shim=True,
+        environ={},
+    )
+
+    assert result == (original, True, False)
+    audit.log_tool_invocation.assert_not_called()
+
+
+def test_host_flag_on_honors_executable_kiro_cli_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shim, _bundle = _bundle_layout(tmp_path)
+    pinned = tmp_path / "pinned" / "kiro-cli"
+    pinned.parent.mkdir()
+    pinned.write_text("#!/bin/sh\nexit 0\n")
+    pinned.chmod(0o755)
+    audit = _mock_sel(monkeypatch)
+
+    argv, delegate, force_outer = apply_host_launcher_shim_bypass(
+        [shim, "acp"],
+        backend=ACP_BACKEND_KIRO,
+        delegate_internal_sandbox=True,
+        bypass_launcher_shim=True,
+        environ={"KIRO_CLI_PATH": str(pinned)},
+    )
+
+    assert argv == [str(pinned), "acp"]
+    assert delegate is False
+    assert force_outer is True
+    audit.log_tool_invocation.assert_called_once()
+
+
+def test_host_flag_on_does_not_capture_a_non_kiro_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shim, _bundle = _bundle_layout(tmp_path)
+    original = [shim, "--acp"]
+    audit = _mock_sel(monkeypatch)
+
+    result = apply_host_launcher_shim_bypass(
+        list(original),
+        backend="kas",
+        delegate_internal_sandbox=False,
+        bypass_launcher_shim=True,
+        environ={},
+    )
+
+    assert result == (original, False, False)
+    audit.log_tool_invocation.assert_not_called()
+
+
+def test_host_bypass_is_refused_when_the_critical_audit_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shim, _bundle = _bundle_layout(tmp_path)
+    original = [shim, "acp"]
+    audit = _mock_sel(monkeypatch)
+    audit.log_tool_invocation.side_effect = OSError("SEL unavailable")
+
+    result = apply_host_launcher_shim_bypass(
+        list(original),
+        backend=ACP_BACKEND_KIRO,
+        delegate_internal_sandbox=True,
+        bypass_launcher_shim=True,
+        environ={},
+    )
+
+    assert result == (original, True, False)
+    audit.log_tool_invocation.assert_called_once()
 
 
 # ── Bundle resolution ─────────────────────────────────────────────────────────
