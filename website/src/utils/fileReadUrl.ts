@@ -51,6 +51,25 @@ export function fileStreamUrl(filePath: string): string {
  * endpoint segment keeps one owner for the construction. The swap cannot
  * collide with the encoded path value — encodeURIComponent turns its
  * slashes into %2F, so the raw endpoint string appears exactly once. */
-export function fileOfficePreviewUrl(filePath: string): string {
-  return fileDownloadUrl(filePath).replace('/api/file-download', '/api/file-office-preview')
+export function fileOfficePreviewUrl(filePath: string, format?: 'blocks'): string {
+  const url = fileDownloadUrl(filePath).replace('/api/file-download', '/api/file-office-preview')
+  return format ? url + '&format=' + format : url
+}
+
+/** Build the /api/file-office-media URL — ONE embedded picture out of a
+ * .docx / .pptx, for an `image` block returned by `format=blocks`.
+ *
+ * `member` is a ZIP member name the blocks payload supplied (`word/media/…`);
+ * the backend screens it against its own allowlist and serves the bytes only
+ * when they sniff as raster, so a name that arrives here mangled fails closed
+ * as a 404 rather than serving something else. Encoded, not interpolated: a
+ * member name contains slashes and dots that must not read as URL structure.
+ *
+ * Derived from fileOfficePreviewUrl for the same reason that one is derived
+ * from fileDownloadUrl — the two endpoints take the identical path + resolve
+ * query shape, so the construction keeps one owner. */
+export function fileOfficeMediaUrl(filePath: string, member: string): string {
+  return fileOfficePreviewUrl(filePath).replace(
+    '/api/file-office-preview', '/api/file-office-media',
+  ) + '&member=' + encodeURIComponent(member)
 }

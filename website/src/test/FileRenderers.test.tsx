@@ -182,7 +182,7 @@ describe('OfficeViewer', () => {
     await waitFor(() => {
       expect(screen.getByText('report.docx')).toBeInTheDocument()
     })
-    expect(screen.getByText('Download')).toBeInTheDocument()
+    expect(screen.getByText('Download original')).toBeInTheDocument()
     expect(screen.getByText(/Preview isn't available for this file/i)).toBeInTheDocument()
   })
 
@@ -195,7 +195,7 @@ describe('OfficeViewer', () => {
     await waitFor(() => {
       expect(screen.getByText('legacy.xls')).toBeInTheDocument()
     })
-    expect(screen.getByText('Download')).toBeInTheDocument()
+    expect(screen.getByText('Download original')).toBeInTheDocument()
     expect(fetchSpy).not.toHaveBeenCalled()
   })
 
@@ -205,7 +205,120 @@ describe('OfficeViewer', () => {
     await waitFor(() => {
       expect(screen.getByText('quarterly-report.docx')).toBeInTheDocument()
     })
-    expect(screen.getByText('Download')).toBeInTheDocument()
+    expect(screen.getByText('Download original')).toBeInTheDocument()
+  })
+
+  it('surfaces a real request failure through ErrorNotice, keeping the download card', async () => {
+    // A 500 is not "this format has no preview" — it is a fault the reader cannot
+    // diagnose, so it gets the agent hand-off. The bytes stay reachable: the
+    // notice is rendered ALONGSIDE the download card, never instead of it.
+    stubPreview({ error: 'boom' }, false, 500)
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/quarterly-report.docx" />)
+    await waitFor(() => {
+      expect(screen.getByTestId('office-preview-error')).toBeInTheDocument()
+    })
+    expect(screen.getByText('Preview failed')).toBeInTheDocument()
+    expect(screen.getByText('Download original')).toBeInTheDocument()
+  })
+
+  it('drops the card hint on a failure, because it contradicts the notice', async () => {
+    // The two lines assert opposite things about the same file: the notice says
+    // the preview FAILED and a retry may work, `office_download_hint` says a
+    // preview "isn't available for this file" at all. On a fault the notice is
+    // the one that knows which case this is, so the hint goes.
+    stubPreview({ error: 'boom' }, false, 500)
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/quarterly-report.docx" />)
+    await waitFor(() => {
+      expect(screen.getByTestId('office-preview-error')).toBeInTheDocument()
+    })
+    expect(screen.queryByText(/Preview isn't available for this file/i)).toBeNull()
+    // The bytes and the notice both stay — this suppresses one line, not the card.
+    expect(screen.getByText('Download original')).toBeInTheDocument()
+  })
+
+  it('keeps the card hint on a 415, where it is the only instruction and true', async () => {
+    // The complement that stops the fix from becoming "never show the hint":
+    // for a format the endpoint refuses, the hint is accurate AND is the only
+    // thing on screen telling the reader what to do.
+    stubPreview({ error: 'unsupported format for inline preview' }, false, 415)
+    renderWithQuery(<OfficeViewer filePath="/home/user/reports/report.docx" />)
+    await waitFor(() => {
+      expect(screen.getByText('report.docx')).toBeInTheDocument()
+    })
+    expect(screen.getByText(/Preview isn't available for this file/i)).toBeInTheDocument()
+  })
+
+  it('states the failure without instructing, because both actions are buttons', async () => {
+    // The prose named the download action, and before that a label it could not
+    // match. With a Retry button and the download card both on screen, naming
+    // either in the sentence is a third description of a control the reader can
+    // already see.
+    stubPreview({ error: 'boom' }, false, 500)
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/quarterly-report.docx" />)
+    await waitFor(() => {
+      expect(screen.getByTestId('office-preview-error')).toBeInTheDocument()
+    })
+    expect(screen.getByText(/Couldn't load the preview/i)).toBeInTheDocument()
+    expect(screen.queryByText(/reopen the file/i)).toBeNull()
+    expect(screen.queryByText(/download it instead/i)).toBeNull()
+  })
+
+  it('offers an inline Retry that refetches in place', async () => {
+    // span 945409eea74e: "Reopen the file to try again" made the user perform by
+    // hand what React Query can redo in place.
+    stubPreview({ error: 'boom' }, false, 500)
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/quarterly-report.docx" />)
+    await waitFor(() => {
+      expect(screen.getByTestId('office-preview-error')).toBeInTheDocument()
+    })
+    const before = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length
+    fireEvent.click(screen.getByTestId('office-preview-retry'))
+    await waitFor(() => {
+      expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(before)
+    })
+  })
+
+  it('shows no Retry when the preview succeeded', async () => {
+    // The complement: Retry belongs to the failure state, not beside a rendered
+    // document where it would offer to redo work that worked.
+    stubPreview({ text: 'Some document text', truncated: false })
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/ok.docx" />)
+    await waitFor(() => expect(screen.getByText('Some document text')).toBeInTheDocument())
+    expect(screen.queryByTestId('office-preview-retry')).toBeNull()
+  })
+
+  it('gives the failure a localized sentence, not a raw status code', async () => {
+    // A bare "HTTP 503" restates the notice's own title, names nothing, and is
+    // unlocalized besides. The next step is the Retry button beside it.
+    stubPreview({ error: 'boom' }, false, 503)
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/quarterly-report.docx" />)
+    await waitFor(() => {
+      expect(screen.getByTestId('office-preview-error')).toBeInTheDocument()
+    })
+    expect(screen.getByText(/Couldn't load the preview/i)).toBeInTheDocument()
+    expect(screen.getByTestId('office-preview-retry')).toBeInTheDocument()
+    expect(screen.queryByText(/HTTP 503/)).toBeNull()
+  })
+
+  it('shows no error notice for a 415, which is a format answer and not a fault', async () => {
+    // The complement, and the reason the two statuses are separated at all:
+    // dressing a normal outcome as an error would train the reader to ignore it.
+    stubPreview({ error: 'unsupported format for inline preview' }, false, 415)
+    renderWithQuery(<OfficeViewer filePath="/home/user/reports/report.docx" />)
+    await waitFor(() => {
+      expect(screen.getByText('report.docx')).toBeInTheDocument()
+    })
+    expect(screen.queryByTestId('office-preview-error')).toBeNull()
+    expect(screen.getByText('Download original')).toBeInTheDocument()
+  })
+
+  it('shows no error notice for a 404', async () => {
+    stubPreview({ error: 'not found' }, false, 404)
+    renderWithQuery(<OfficeViewer filePath="/home/user/reports/gone.docx" />)
+    await waitFor(() => {
+      expect(screen.getByText('gone.docx')).toBeInTheDocument()
+    })
+    expect(screen.queryByTestId('office-preview-error')).toBeNull()
   })
 
   it('falls back to the download card when extraction returns empty text', async () => {
@@ -216,7 +329,7 @@ describe('OfficeViewer', () => {
     await waitFor(() => {
       expect(screen.getByText('blank.docx')).toBeInTheDocument()
     })
-    expect(screen.getByText('Download')).toBeInTheDocument()
+    expect(screen.getByText('Download original')).toBeInTheDocument()
   })
 
   it('renders the truncation notice in the pinned footer when the backend flags truncation', async () => {
@@ -472,3 +585,295 @@ describe('columnLetter', () => {
     expect(columnLetter(702)).toBe('AAA')
   })
 })
+
+/* ── OfficeViewer: the structured (format=blocks) preview ──────────────────
+ *
+ * The component asks for blocks first and falls back to text, so these tests
+ * answer per-URL rather than with one body: which of the two shapes came back
+ * IS the thing under test. What is pinned is the block→element contract the
+ * backend's payload is rendered through, the text fallback, and the one
+ * property the slide fold has to keep — a closed fold contributes no text nodes,
+ * so a find never reports a match the reader cannot see. */
+describe('OfficeViewer structured blocks', () => {
+  const realFetch = globalThis.fetch
+  let urls: string[] = []
+
+  /** Answer /api/file-office-preview by whether it asked for blocks or text. */
+  function stubByFormat(
+    blocks: unknown[] | null,
+    text: { text?: string; truncated?: boolean } | null,
+  ) {
+    urls = []
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      urls.push(url)
+      const wantsBlocks = url.includes('format=blocks')
+      const body = wantsBlocks ? { blocks: blocks ?? [], truncated: false } : (text ?? {})
+      return Promise.resolve({
+        ok: wantsBlocks ? blocks !== null : text !== null,
+        status: 200,
+        json: () => Promise.resolve(body),
+      } as unknown as Response)
+    }) as unknown as typeof fetch
+  }
+
+  afterEach(() => {
+    globalThis.fetch = realFetch
+    vi.restoreAllMocks()
+  })
+
+  it('asks for blocks before text', async () => {
+    stubByFormat([{ type: 'paragraph', runs: [{ text: 'Body copy.' }] }], null)
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/report.docx" />)
+    await waitFor(() => expect(screen.getByText('Body copy.')).toBeInTheDocument())
+    expect(urls[0]).toContain('format=blocks')
+    // Blocks came back non-empty, so the text request is never made.
+    expect(urls).toHaveLength(1)
+  })
+
+  it('renders headings at their document level', async () => {
+    stubByFormat([
+      { type: 'heading', level: 1, text: 'Quarterly report' },
+      { type: 'heading', level: 3, text: 'Regional detail' },
+    ], null)
+    const { container } = renderWithQuery(<OfficeViewer filePath="/home/user/docs/r.docx" />)
+    await waitFor(() => expect(screen.getByText('Quarterly report')).toBeInTheDocument())
+    expect(container.querySelector('h1')?.textContent).toBe('Quarterly report')
+    expect(container.querySelector('h3')?.textContent).toBe('Regional detail')
+  })
+
+  it('clamps a deeper heading level to h6 rather than emitting an invalid tag', async () => {
+    // .docx can nominally carry Heading7; HTML stops at h6.
+    stubByFormat([{ type: 'heading', level: 9, text: 'Deep' }], null)
+    const { container } = renderWithQuery(<OfficeViewer filePath="/home/user/docs/r.docx" />)
+    await waitFor(() => expect(screen.getByText('Deep')).toBeInTheDocument())
+    expect(container.querySelector('h6')?.textContent).toBe('Deep')
+    expect(container.querySelector('h7')).toBeNull()
+  })
+
+  it('renders bold and italic runs as strong and em', async () => {
+    stubByFormat([{
+      type: 'paragraph',
+      runs: [
+        { text: 'plain ' },
+        { text: 'strong', bold: true },
+        { text: 'slanted', italic: true },
+      ],
+    }], null)
+    const { container } = renderWithQuery(<OfficeViewer filePath="/home/user/docs/r.docx" />)
+    await waitFor(() => expect(screen.getByText('strong')).toBeInTheDocument())
+    expect(container.querySelector('strong')?.textContent).toBe('strong')
+    expect(container.querySelector('em')?.textContent).toBe('slanted')
+  })
+
+  it('renders an ordered list as ol and an unordered one as ul', async () => {
+    stubByFormat([
+      { type: 'list', ordered: true, items: ['first', 'second'] },
+      { type: 'list', ordered: false, items: ['dot'] },
+    ], null)
+    const { container } = renderWithQuery(<OfficeViewer filePath="/home/user/docs/r.docx" />)
+    await waitFor(() => expect(screen.getByText('first')).toBeInTheDocument())
+    expect(container.querySelectorAll('ol > li')).toHaveLength(2)
+    expect(container.querySelectorAll('ul > li')).toHaveLength(1)
+  })
+
+  it('renders a table with its first row as the header', async () => {
+    // A table inside a report or a deck is written with a header row, unlike a
+    // spreadsheet's row 1 — which is why SheetViewer does the opposite.
+    stubByFormat([
+      { type: 'table', rows: [['Region', 'Total'], ['EU', '12']] },
+    ], null)
+    const { container } = renderWithQuery(<OfficeViewer filePath="/home/user/docs/r.docx" />)
+    await waitFor(() => expect(screen.getByText('Region')).toBeInTheDocument())
+    expect([...container.querySelectorAll('th')].map(e => e.textContent)).toEqual(['Region', 'Total'])
+    expect([...container.querySelectorAll('td')].map(e => e.textContent)).toEqual(['EU', '12'])
+  })
+
+  it('reports a column trim at the table, not as a document-level truncation', async () => {
+    // The pinned bar says "only the beginning of this document", which describes
+    // running out of budget part-way through. A table that lost its right-hand
+    // columns is otherwise complete, so saying the first about the second sends
+    // the reader looking for missing pages.
+    stubByFormat([
+      { type: 'table', rows: [['Region', 'Total']], truncated_cols: true },
+    ], null)
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/wide.docx" />)
+    await waitFor(() => expect(screen.getByText('Region')).toBeInTheDocument())
+    expect(screen.getByTestId('office-table-cols-truncated')).toBeInTheDocument()
+    expect(screen.getByText('Additional columns not shown')).toBeInTheDocument()
+    expect(screen.queryByText(/only the beginning of this document/i)).toBeNull()
+  })
+
+  it('shows no column-trim notice on a table that kept every column', async () => {
+    stubByFormat([
+      { type: 'table', rows: [['Region', 'Total']], truncated_cols: false },
+    ], null)
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/narrow.docx" />)
+    await waitFor(() => expect(screen.getByText('Region')).toBeInTheDocument())
+    expect(screen.queryByTestId('office-table-cols-truncated')).toBeNull()
+  })
+
+  it('renders an embedded picture through the media endpoint with the member encoded', async () => {
+    stubByFormat([{ type: 'image', member: 'word/media/image1.png' }], null)
+    const { container } = renderWithQuery(<OfficeViewer filePath="/home/user/docs/r.docx" />)
+    await waitFor(() => expect(container.querySelector('img')).not.toBeNull())
+    const img = container.querySelector('img') as HTMLImageElement
+    expect(img.getAttribute('src')).toContain('/api/file-office-media?path=')
+    // Encoded, not interpolated: the slashes must not read as URL structure.
+    expect(img.getAttribute('src')).toContain('member=word%2Fmedia%2Fimage1.png')
+    // No alternative text exists in the payload, so the picture is decorative
+    // rather than carrying an invented description.
+    expect(img.getAttribute('alt')).toBe('')
+  })
+
+  it('replaces a picture whose fetch fails with a visible placeholder', async () => {
+    // Not a broken-image glyph and not nothing: a vanished figure is the one
+    // failure the reader cannot notice, since the surrounding text still reads.
+    stubByFormat([{ type: 'image', member: 'word/media/image1.png' }], null)
+    const { container } = renderWithQuery(<OfficeViewer filePath="/home/user/docs/r.docx" />)
+    await waitFor(() => expect(container.querySelector('img')).not.toBeNull())
+    fireEvent.error(container.querySelector('img') as HTMLImageElement)
+    await waitFor(() => expect(container.querySelector('img')).toBeNull())
+    expect(screen.getByTestId('office-image-unavailable')).toBeInTheDocument()
+    expect(screen.getByText(/Picture unavailable/i)).toBeInTheDocument()
+  })
+
+  it('renders a placeholder for a picture the backend could not serve', async () => {
+    // `member: null` is the backend saying the figure exists but is a metafile,
+    // an SVG, or a missing part — kept in place so the reader sees where it was.
+    stubByFormat([
+      { type: 'paragraph', runs: [{ text: 'See the chart below.' }] },
+      { type: 'image', member: null },
+    ], null)
+    const { container } = renderWithQuery(<OfficeViewer filePath="/home/user/docs/r.docx" />)
+    await waitFor(() => expect(screen.getByTestId('office-image-unavailable')).toBeInTheDocument())
+    expect(container.querySelector('img')).toBeNull()
+  })
+
+  it('skips a block type this build does not know', async () => {
+    // Older bundle, newer backend: an unknown block is dropped, never rendered
+    // as raw JSON.
+    stubByFormat([
+      { type: 'sparkline', points: [1, 2, 3] },
+      { type: 'paragraph', runs: [{ text: 'still here' }] },
+    ], null)
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/r.docx" />)
+    await waitFor(() => expect(screen.getByText('still here')).toBeInTheDocument())
+    expect(screen.queryByText(/sparkline/)).toBeNull()
+  })
+
+  it('marks the text fallback as plain text so a flattened table is not mistaken for the file', async () => {
+    // Without this the reader cannot tell a document that never had a table from
+    // one whose table the preview dropped.
+    stubByFormat([], { text: 'Region\tSignups\nEMEA\t4,182', truncated: false })
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/odd.docx" />)
+    await waitFor(() => {
+      expect(screen.getByTestId('office-plain-text-notice')).toBeInTheDocument()
+    })
+    expect(screen.getByText(/headings, lists and tables couldn't be read/i)).toBeInTheDocument()
+  })
+
+  it('shows no plain-text marker when the structured blocks did render', async () => {
+    // The complement: the marker must not appear on a successful structured
+    // render, or it would claim a loss that did not happen.
+    stubByFormat([{ type: 'heading', level: 1, text: 'Quarterly report' }], null)
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/r.docx" />)
+    await waitFor(() => {
+      expect(screen.getByText('Quarterly report')).toBeInTheDocument()
+    })
+    expect(screen.queryByTestId('office-plain-text-notice')).toBeNull()
+  })
+
+  it('falls back to the text preview when blocks comes back empty', async () => {
+    // A container the structured extractor could not read. The flat extractor
+    // sometimes still gets something out of the same file, so this is what keeps
+    // the preview never worse than before.
+    stubByFormat([], { text: 'Flat text still available', truncated: false })
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/odd.docx" />)
+    await waitFor(() => expect(screen.getByText('Flat text still available')).toBeInTheDocument())
+    expect(urls[0]).toContain('format=blocks')
+    expect(urls[1]).not.toContain('format=blocks')
+  })
+
+  it('falls back to the download card when both shapes come back empty', async () => {
+    stubByFormat([], { text: '', truncated: false })
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/blank.docx" />)
+    await waitFor(() => expect(screen.getByText('blank.docx')).toBeInTheDocument())
+    expect(screen.getByText('Download original')).toBeInTheDocument()
+  })
+
+  it('keeps the compact download affordance and the truncation notice with blocks', async () => {
+    urls = []
+    globalThis.fetch = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({
+          blocks: [{ type: 'paragraph', runs: [{ text: 'Body.' }] }],
+          truncated: true,
+        }),
+      } as unknown as Response),
+    ) as unknown as typeof fetch
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/huge.docx" />)
+    await waitFor(() => expect(screen.getByText('Body.')).toBeInTheDocument())
+    expect(screen.getByText('Download original')).toBeInTheDocument()
+    expect(screen.getByText(/Preview shows only the beginning/i)).toBeInTheDocument()
+  })
+
+  it('renders one card per pptx slide, in the order the payload gives', async () => {
+    stubByFormat([
+      { type: 'slide', index: 1, title: 'Summary', blocks: [{ type: 'list', ordered: false, items: ['alpha'] }] },
+      { type: 'slide', index: 2, title: 'Appendix', blocks: [] },
+    ], null)
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/deck.pptx" />)
+    await waitFor(() => expect(screen.getByText('Summary')).toBeInTheDocument())
+    expect(screen.getByText('Slide 1')).toBeInTheDocument()
+    expect(screen.getByText('Slide 2')).toBeInTheDocument()
+    // Presentation order, not the payload sorted or reversed.
+    const rendered = screen.getByText('Slide 1').compareDocumentPosition(screen.getByText('Slide 2'))
+    expect(rendered & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(screen.getByText('alpha')).toBeInTheDocument()
+  })
+
+  it('renders a slide with no title as a bare Slide N card', async () => {
+    stubByFormat([{ type: 'slide', index: 1, title: '', blocks: [] }], null)
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/deck.pptx" />)
+    await waitFor(() => expect(screen.getByText('Slide 1')).toBeInTheDocument())
+  })
+
+  it('keeps speaker notes out of the DOM until the fold is opened', async () => {
+    // Not merely hidden: a closed fold must contribute no text nodes, or a find
+    // over the panel counts matches the reader cannot see.
+    stubByFormat([{
+      type: 'slide', index: 1, title: 'Intro', blocks: [],
+      notes: 'Remember to mention the deadline',
+    }], null)
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/deck.pptx" />)
+    await waitFor(() => expect(screen.getByText('Speaker notes')).toBeInTheDocument())
+    const toggle = screen.getByRole('button', { name: /Speaker notes/i })
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByText(/mention the deadline/)).toBeNull()
+    fireEvent.click(toggle)
+    await waitFor(() => expect(screen.getByText(/mention the deadline/)).toBeInTheDocument())
+    expect(toggle).toHaveAttribute('aria-expanded', 'true')
+    fireEvent.click(toggle)
+    await waitFor(() => expect(screen.queryByText(/mention the deadline/)).toBeNull())
+  })
+
+  it('offers no notes fold for a slide that has none', async () => {
+    stubByFormat([{ type: 'slide', index: 1, title: 'Intro', blocks: [] }], null)
+    renderWithQuery(<OfficeViewer filePath="/home/user/docs/deck.pptx" />)
+    await waitFor(() => expect(screen.getByText('Slide 1')).toBeInTheDocument())
+    expect(screen.queryByText('Speaker notes')).toBeNull()
+  })
+
+  it('renders block text as ordinary text nodes, not inside a pre', async () => {
+    // The panel's find walks text nodes; a <pre> was fine for one blob, but the
+    // structured render must not smuggle the document back into one.
+    stubByFormat([{ type: 'heading', level: 2, text: 'Findable heading' }], null)
+    const { container } = renderWithQuery(<OfficeViewer filePath="/home/user/docs/r.docx" />)
+    await waitFor(() => expect(screen.getByText('Findable heading')).toBeInTheDocument())
+    expect(container.querySelector('pre')).toBeNull()
+  })
+})
+
