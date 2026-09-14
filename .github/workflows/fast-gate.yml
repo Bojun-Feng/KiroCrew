@@ -401,3 +401,30 @@ jobs:
         # No setup-python step: ubuntu-latest ships Python 3 and the script is
         # stdlib-only.
         run: ./scripts/docs-lint.sh
+
+  connector-manifest-schema:
+    name: Connector Manifest Schema Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate every connector-campaign manifest entry against its schema
+        # Whole-tree, not diff-scoped: every committed entry under
+        # docs/system-specs/connector-manifest/entries/ is re-validated on every
+        # push, not just the ones a diff touched, because a manifest entry's
+        # cross-file references (ConformanceRun/EvidenceReceipt in the sibling
+        # runs/ and receipts/ directories) can go stale from a change to a
+        # DIFFERENT entry's sibling record, not only from editing the entry
+        # itself — see check_connector_manifest.py's own "immutable ref
+        # binding" staleness check. Contract:
+        # docs/system-specs/modules/connector-capability-manifest.md
+        run: |
+          # Self-test first: one probe per schema rule, so a rule that silently
+          # stops matching (a required-field check, a snapshot_ref resolution
+          # rule, a three-way cross-reference equality) fails here instead of
+          # shipping a validator that passes everything.
+          python3 scripts/check_connector_manifest.py --test
+          python3 scripts/check_connector_manifest.py
