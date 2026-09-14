@@ -1177,6 +1177,93 @@ def test_redact_history_rows_only_touches_the_window_not_the_frozen_prefix():
     assert all(secret not in m["content"] for m in out_all)
 
 
+def test_redact_history_rows_scrubs_string_leaves_of_structured_content():
+    """A non-string ``content`` (nested multi-part content from a legacy or
+    hand-edited transcript) must have its string leaves redacted, not be passed
+    through unredacted.
+
+    Before this fix ``_redact_history_rows`` skipped any non-string ``content``
+    (``if isinstance(content, str)``), so a credential nested in structured
+    content reached the broadcaster verbatim. This asserts a token-shaped string
+    buried in a dict/list ``content`` does NOT survive the redaction pass that
+    feeds ``_hydrate_slot_from_history`` (and thus the broadcaster). The shape is
+    preserved (still a list of dicts), not stringified, and the caller's original
+    nested object is not mutated.
+
+    Negative-verified: revert ``_redact_structured_content`` to the old
+    passthrough (`else: pass`, keep the original ``content``) and this test fails
+    -- the token survives in the output.
+    """
+    from kiro_crew.dashboard.chat_handlers import _redact_history_rows
+
+    secret = "ghp_" + "b" * 36  # token-shaped; the credential scanner redacts it
+    nested = [
+        {"type": "text", "text": f"leading {secret} trailing"},
+        {"type": "text", "text": [f"deeper {secret}"]},  # list leaf, one level down
+    ]
+    original = {"role": "assistant", "content": nested, "ts": ""}
+    rows = [original]
+
+    out = _redact_history_rows(rows, window_limit=None)
+
+    # The token is gone from every string leaf of the emitted content.
+    def _leaves(v):
+        if isinstance(v, str):
+            yield v
+        elif isinstance(v, dict):
+            for item in v.values():
+                yield from _leaves(item)
+        elif isinstance(v, (list, tuple)):
+            for item in v:
+                yield from _leaves(item)
+
+    assert all(secret not in leaf for leaf in _leaves(out[0]["content"]))
+    # Shape preserved: still a list of two dicts, not stringified.
+    assert isinstance(out[0]["content"], list) and len(out[0]["content"]) == 2
+    assert all(isinstance(part, dict) for part in out[0]["content"])
+    # The caller's original nested object was not mutated in place.
+    assert secret in original["content"][0]["text"]
+
+
+def test_redact_structured_content_is_bounded_and_never_raises():
+    """The recursive redactor must not run unbounded or raise on a corrupt/
+    hostile row: over-deep nesting or too many nodes drops the offending subtree
+    (fail-closed) instead of leaking it or blowing the stack.
+    """
+    from kiro_crew.dashboard.chat_handlers import (
+        _REDACT_MAX_DEPTH,
+        _redact_structured_content,
+    )
+
+    secret = "ghp_" + "c" * 36
+    # Nest deeper than the depth cap: the over-deep leaf must be dropped, never
+    # emitted unredacted, and the walk must return (not raise / not recurse away).
+    deep = leaf = {}
+    for _ in range(_REDACT_MAX_DEPTH + 5):
+        child = {}
+        leaf["next"] = child
+        leaf = child
+    leaf["secret"] = secret
+
+    out = _redact_structured_content(deep)
+
+    def _all_strings(v):
+        if isinstance(v, str):
+            yield v
+        elif isinstance(v, dict):
+            for item in v.values():
+                yield from _all_strings(item)
+        elif isinstance(v, (list, tuple)):
+            for item in v:
+                yield from _all_strings(item)
+
+    # The token, being past the depth cap, never appears in the output.
+    assert secret not in "".join(_all_strings(out))
+    # A plain non-container leaf is returned unchanged (nothing to redact).
+    assert _redact_structured_content(42) == 42
+    assert _redact_structured_content(None) is None
+
+
 def test_named_create_on_a_retracted_under_construction_key_is_refused(tmp_path):
     """The retract-window hijack: a named create on the predictable minted key,
     while that key is retracted from ``_slots`` but still under construction,

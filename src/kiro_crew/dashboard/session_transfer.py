@@ -1410,9 +1410,11 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
         # Import synthesised its metadata; it read no transcript off disk, so the
         # delete-won disk-identity guard must stay dormant.
         disk_meta_observed=False,
-        # Silent replay of a bundle onto a slot that is retracted throughout
-        # hydration: broadcasting each row would push a retracted slot's peer
-        # content to every client and retire live question cards.
+        # Silent replay of a bundle onto a slot that stays registered and under
+        # construction throughout its synchronous hydration (it is retracted from
+        # ``_slots`` only afterwards, for the async tail below): broadcasting each
+        # row would push an under-construction slot's peer content to every client
+        # and retire live question cards.
         broadcast_rows=False,
         # Bundle rows carry no message id; mint one, or the imported rows land
         # permanently id-less and drop out of mid-keyed features.

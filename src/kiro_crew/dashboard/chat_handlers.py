@@ -8925,6 +8925,63 @@ async def _live_slot_resume_response(
     return None
 
 
+# Bounds for the recursive structured-content redactor below. A row's
+# ``content`` is normally a string, but a legacy or hand-edited transcript can
+# carry a nested dict/list (multi-part content). We redact every string leaf
+# rather than skip such a row, but a corrupt or hostile row must not let the
+# walk run unbounded or blow the stack: _REDACT_MAX_DEPTH caps nesting and
+# _REDACT_MAX_NODES caps total visited nodes. Values: real multi-part content is
+# a shallow list of a handful of dicts (role/text/type parts), so depth 8 and
+# 10,000 nodes clear every legitimate shape by orders of magnitude while still
+# bounding an adversarial row to a fixed, cheap amount of work. On overflow the
+# offending subtree is dropped (replaced with ``None``) rather than emitted
+# unredacted or raised — dropping is fail-closed (no leak) and, per the resume
+# read-side contract, must never raise (a legacy row must not break resume).
+_REDACT_MAX_DEPTH = 8
+_REDACT_MAX_NODES = 10_000
+
+
+def _redact_structured_content(value: object) -> object:
+    """Return a NEW value of the same shape with every string leaf redacted.
+
+    Handles the non-string ``content`` a legacy/corrupt transcript row can carry
+    (nested dict/list of multi-part content). Never mutates the input: dicts and
+    lists are rebuilt, so a caller holding the original (whose top level is only
+    shallow-copied by ``_redact_history_rows``) is not poisoned through a shared
+    nested container. Never raises and never stringifies — the shape is preserved
+    so the frontend renders it as before, only with credentials/exfil-URLs
+    scrubbed from the string leaves. Bounded by ``_REDACT_MAX_DEPTH`` /
+    ``_REDACT_MAX_NODES`` (see the module constants above); an overflowing
+    subtree is dropped to ``None`` rather than emitted unredacted.
+    """
+    # Node budget is shared across the whole walk (not per-level), so a wide-but-
+    # shallow row is bounded too. A one-element list carries the counter by
+    # reference through the recursion.
+    budget = [_REDACT_MAX_NODES]
+
+    def _walk(v: object, depth: int) -> object:
+        if budget[0] <= 0 or depth > _REDACT_MAX_DEPTH:
+            # Fail closed: drop the subtree we cannot fully scan rather than pass
+            # it through unredacted.
+            return None
+        budget[0] -= 1
+        if isinstance(v, str):
+            v, _ = redact_exfiltration_urls(v)
+            v, _ = redact_credentials(v)
+            return v
+        if isinstance(v, dict):
+            return {k: _walk(item, depth + 1) for k, item in v.items()}
+        if isinstance(v, list):
+            return [_walk(item, depth + 1) for item in v]
+        if isinstance(v, tuple):
+            return tuple(_walk(item, depth + 1) for item in v)
+        # A non-container, non-string leaf (int/bool/None/float) carries no text
+        # to redact; return it unchanged.
+        return v
+
+    return _walk(value, 0)
+
+
 def _redact_history_rows(rows: list[dict], *, window_limit: int | None = None) -> list[dict]:
     """Content-redact non-user rows BEFORE construction, returning new rows.
 
@@ -8949,10 +9006,16 @@ def _redact_history_rows(rows: list[dict], *, window_limit: int | None = None) -
     or any write path that bypassed the boundary. It must not be dropped.
 
     User rows are left untouched (matching the write boundary, which redacts
-    non-user text). A non-string ``content`` (legacy/corrupt JSONL) is passed
-    through unchanged rather than coerced -- redacting it would raise. Row dicts
-    in the redacted window are shallow-copied so the caller's input is not
-    mutated; prefix rows are returned as-is.
+    non-user text). A non-string ``content`` (legacy/corrupt JSONL, or nested
+    multi-part content) has its string leaves redacted in place-preserving shape
+    by ``_redact_structured_content`` rather than being passed through
+    unredacted: resume is reachable for such rows precisely because this pass is
+    defense-in-depth for transcripts a write-time rule never covered, so leaving
+    a non-string row unscrubbed would let a credential in nested content reach a
+    broadcaster. Row dicts in the redacted window are shallow-copied so the
+    caller's input is not mutated; the structured redactor rebuilds nested
+    containers, so no shared nested object is poisoned either. Prefix rows are
+    returned as-is.
     """
     if window_limit is None or len(rows) <= window_limit:
         prefix: list[dict] = []
@@ -8968,6 +9031,10 @@ def _redact_history_rows(rows: list[dict], *, window_limit: int | None = None) -
                 content, _ = redact_exfiltration_urls(content)
                 content, _ = redact_credentials(content)
                 m = {**m, "content": content}
+            else:
+                # Legacy/corrupt or nested multi-part content: redact its string
+                # leaves without stringifying or mutating the caller's object.
+                m = {**m, "content": _redact_structured_content(content)}
         out.append(m)
     return out
 
@@ -9030,10 +9097,12 @@ def _materialise_slot_from_history(
     ``broadcast_rows`` and ``mint_missing_mids`` are likewise facts about the
     rows. ``broadcast_rows`` is whether hydrating a row should emit a live
     ``chat_message`` SSE event: resume is an interactive open (True), import is a
-    silent replay of a bundle onto a slot that is retracted during hydration, so
-    it passes False (matching the tunnel importer and the ``append`` docstring's
-    list of replay callers) — broadcasting would push a retracted slot's peer
-    content to every client and retire live question cards. ``mint_missing_mids``
+    silent replay of a bundle onto a slot that stays REGISTERED and under
+    construction throughout its (synchronous) hydration and is retracted from
+    ``_slots`` only afterwards, for the async finalization tail; import passes
+    False (matching the tunnel importer and the ``append`` docstring's
+    list of replay callers) — broadcasting would push an under-construction
+    slot's peer content to every client and retire live question cards. ``mint_missing_mids``
     is whether these rows need message ids minted: resume's disk rows already
     carry mids (False), import's bundle rows have none, so it passes True or the
     imported rows land permanently id-less and drop out of mid-keyed features.
