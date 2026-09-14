@@ -150,6 +150,16 @@ def _read(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _enroll(*names: str, generation: str = "default") -> None:
+    """Give rows the crewmate ENROLLMENT record the roster reads (what a confirmed
+    hire writes): a row in ``config.agents`` alone is a session agent, not a
+    crewmate, so roster tests enroll the rows they expect to see."""
+    from kiro_crew import agent_state
+
+    for name in names:
+        agent_state.set_crewmate_record(name, generation=generation, template="t", hired_at="")
+
+
 def _legacy_config() -> dict:
     return {
         "agents": {
@@ -393,6 +403,35 @@ class TestSensitiveLegacyKeys:
         # The typed key is still the display name, which the read routes mask.
         assert cfg.agents[minted].display_name == key
 
+    def test_a_grammar_valid_credential_key_is_migrated_too(self, cfg_path: Path):
+        """An AWS access key id is INSIDE the member-id grammar (20 alphanumerics),
+        so a grammar-only migration would leave it as the key and render it on
+        every id surface. The migration decides on shape AND sensitivity: such
+        a key moves to an opaque id like a malformed one, in the base document
+        and in the overlay alike, and the raw value never reaches the roster."""
+        from kiro_crew.member_identity import opaque_member_id
+
+        key = "AKIAIOSFODNN7EXAMPLE"
+        assert mi.is_valid_member_id(key)
+        _write(
+            cfg_path,
+            {
+                "agents": {"default": {"kiro_agent": "kirocrew"}, key: {"kiro_agent": "kirocrew"}},
+                "default_agent": "default",
+                "workspaces": {"default": {"dir": "workspace"}},
+            },
+        )
+        cfg = KiroCrewConfig.load()
+        assert key not in cfg.agents
+        (minted,) = [k for k in cfg.agents if k != "default"]
+        assert minted == opaque_member_id(key) and "AKIA" not in minted
+        on_disk = _read(cfg_path)["agents"]
+        assert key not in on_disk
+        assert on_disk[minted]["legacy_key"] == key
+        assert cfg.agents[minted].display_name == key
+        # Settled on the next load: nothing moves again.
+        assert set(KiroCrewConfig.load().agents) == {"default", minted}
+
     def test_a_key_whose_sanitized_form_is_the_secret_is_opaque_too(self):
         from kiro_crew.config.loader import _rekey_base
         from kiro_crew.member_identity import opaque_member_id
@@ -494,6 +533,19 @@ class TestCreateMintsTheId:
             # BOTH the typed name and the id it shortened to.
             assert "Case Competition" in data["error"]
             assert "Case-Competition" in data["error"]
+            # The duplicate guard is not the client's to switch off: a stray
+            # ``named_by_user: false`` in the body is not read, and the create
+            # still refuses.
+            resp = await client.post(
+                "/api/agents",
+                json={"name": "Case Competition", "kiro_agent": "kirocrew", "named_by_user": False},
+            )
+            assert resp.status == 409
+            assert (await resp.json())["code"] == "agent_exists"
+            roster = await (await client.get("/api/agents")).json()
+            assert [a["name"] for a in roster["agents"] if a["name"].startswith("Case")] == [
+                "Case-Competition"
+            ]
 
     @pytest.mark.asyncio
     async def test_collision_on_the_typed_id_keeps_the_classic_message(self, seeded_cfg: Path):
@@ -623,6 +675,177 @@ def _members_app(state) -> web.Application:
     return app
 
 
+class TestExplicitEnrollment:
+    """A crewmate exists only after a confirmed hire wrote its enrollment record.
+    Presence in ``config.agents`` -- a built-in, ``default``, a file or app the
+    agent sync registered, a plain crew -- never puts a row on the roster."""
+
+    def _fresh_config(self) -> dict:
+        return {
+            "agents": {
+                "default": {"kiro_agent": "kirocrew", "memory_store": "default"},
+                "kirocrew-worker": {"kiro_agent": "kirocrew-worker", "source": "builtin"},
+                "release-notes-writer": {"kiro_agent": "release-notes-writer", "source": "local"},
+                "oncall-pack--triage": {
+                    "kiro_agent": "oncall-pack--triage",
+                    "source": "package:oncall-pack",
+                },
+                "my-plain-crew": {
+                    "kiro_agent": "reviewer",
+                    "display_name": "My plain crew",
+                    "memory_store": "default",
+                },
+            },
+            "default_agent": "default",
+            "workspaces": {"default": {"dir": "workspace"}},
+        }
+
+    @pytest.mark.asyncio
+    async def test_fresh_state_lists_no_crewmates_however_many_templates_exist(
+        self, tmp_path: Path
+    ):
+        """Templates of every source are available (they are rows, dispatchable
+        and usable in sessions) and the roster is EMPTY -- on the first read and
+        on a re-read."""
+        from kiro_crew import agent_state
+        from kiro_crew.dashboard.handlers import members as handlers
+
+        cfg_file = tmp_path / "config.json"
+        _write(cfg_file, self._fresh_config())
+        state = _make_state(tmp_path)
+        with unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_file):
+            async with TestClient(TestServer(_members_app(state))) as client:
+                for _ in range(2):
+                    resp = await client.get("/api/members")
+                    assert resp.status == 200
+                    assert (await resp.json())["members"] == []
+            cfg = KiroCrewConfig.load()
+        # Every row is still there for sessions; none is a crewmate.
+        assert set(cfg.agents) == set(self._fresh_config()["agents"])
+        assert agent_state.all_crewmate_records() == {}
+        assert handlers.enrolled_member_ids(cfg) == []
+
+    @pytest.mark.asyncio
+    async def test_a_record_for_another_generation_is_not_this_row(self, tmp_path: Path):
+        """The record names the private store the hire minted; a row recreated
+        under the same id with another store is not the crewmate that record
+        enrolled, and a record with no row is inert."""
+        from kiro_crew import agent_state
+        from kiro_crew.dashboard.handlers import members as handlers
+
+        cfg_file = tmp_path / "config.json"
+        data = self._fresh_config()
+        data["agents"]["Nia"] = {"kiro_agent": "Nia", "memory_store": "member-nia-2"}
+        _write(cfg_file, data)
+        _enroll("Nia", generation="member-nia-1")
+        agent_state.set_crewmate_record("Gone", generation="member-gone", template="t", hired_at="")
+        state = _make_state(tmp_path)
+        with unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_file):
+            cfg = KiroCrewConfig.load()
+            assert handlers.enrolled_member_ids(cfg) == []
+            agent_state.set_crewmate_record(
+                "Nia", generation="member-nia-2", template="t", hired_at=""
+            )
+            assert handlers.enrolled_member_ids(cfg) == ["Nia"]
+            async with TestClient(TestServer(_members_app(state))) as client:
+                rows = [
+                    r["name"] for r in (await (await client.get("/api/members")).json())["members"]
+                ]
+        assert rows == ["Nia"]
+
+    @pytest.mark.asyncio
+    async def test_an_upgrade_enrolls_nothing_a_forked_private_copy_on_a_member_store_included(
+        self, tmp_path: Path
+    ):
+        """Upgrade path: no build before this one left a mark only a hire could
+        have written. A row whose ``kiro_agent`` is a private copy with lineage
+        naming the row AND a ``member-`` store is exactly what the crew editor's
+        fork plus private-memory provisioning give a plain crew, so it is NOT
+        enrolled, and neither is any other pre-existing row. Nothing is deleted
+        or rebound."""
+        from kiro_crew import agent_state
+        from kiro_crew.dashboard.handlers import members as handlers
+
+        cfg_file = tmp_path / "config.json"
+        data = self._fresh_config()
+        data["agents"]["Nia"] = {"kiro_agent": "Nia", "memory_store": "member-nia-1"}
+        data["agents"]["forked-crew"] = {"kiro_agent": "forked-crew", "memory_store": "default"}
+        _write(cfg_file, data)
+        agent_state.set_fork_info("Nia", "reviewer", "Nia")
+        agent_state.set_fork_info("forked-crew", "reviewer", "forked-crew")
+        state = _make_state(tmp_path)
+        with unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_file):
+            async with TestClient(TestServer(_members_app(state))) as client:
+                for _ in range(2):
+                    resp = await client.get("/api/members")
+                    assert resp.status == 200
+                    assert (await resp.json())["members"] == []
+            cfg = KiroCrewConfig.load()
+        assert agent_state.all_crewmate_records() == {}
+        assert handlers.enrolled_member_ids(cfg) == []
+        assert set(cfg.agents) >= set(self._fresh_config()["agents"]) | {"Nia", "forked-crew"}
+        assert cfg.agents["Nia"].kiro_agent == "Nia"
+        assert cfg.agents["Nia"].memory_store == "member-nia-1"
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_record_is_a_503_not_an_empty_roster(self, tmp_path: Path):
+        """The roster GET fails closed the way every member write does: a sidecar
+        that cannot be read answers 503 ``members_unavailable`` (the page renders
+        its load error), never a clean empty list that reads as a fresh
+        install. The record itself is left as it is for repair."""
+        from kiro_crew import agent_state
+
+        cfg_file = tmp_path / "config.json"
+        data = self._fresh_config()
+        data["agents"]["Nia"] = {"kiro_agent": "Nia", "memory_store": "member-nia-1"}
+        _write(cfg_file, data)
+        _enroll("Nia", generation="member-nia-1")
+        sidecar = agent_state._state_path()
+        sidecar.write_text("{not json", encoding="utf-8")
+        state = _make_state(tmp_path)
+        with unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_file):
+            async with TestClient(TestServer(_members_app(state))) as client:
+                resp = await client.get("/api/members")
+                assert resp.status == 503, await resp.text()
+                body = await resp.json()
+                assert body["code"] == "members_unavailable"
+                assert "members" not in body
+        assert sidecar.read_text(encoding="utf-8") == "{not json"
+
+    def test_a_staged_generation_covers_the_row_on_either_store(self):
+        """The two-phase store move (``stage`` before the config write, ``move``
+        after): the record covers the old store and the new one in between, a
+        move never finalized is finalized by the next stage, an unlanded write
+        is unstaged, and a record of another generation is left alone."""
+        from kiro_crew import agent_state
+
+        agent_state.set_crewmate_record("Nia", generation="s1", template="t", hired_at="")
+        assert agent_state.stage_crewmate_generation("Nia", old="other", new="s2") is False
+        assert agent_state.stage_crewmate_generation("Nia", old="s1", new="s2") is True
+        rec = agent_state.get_crewmate_record("Nia", strict=True)
+        assert rec is not None and rec["generation"] == "s1" and rec["pending_generation"] == "s2"
+        assert agent_state.record_covers_store(rec, "s1") and agent_state.record_covers_store(
+            rec, "s2"
+        )
+        assert not agent_state.record_covers_store(rec, "s3")
+        # The write did not land: unstaged, the record names s1 alone.
+        assert agent_state.unstage_crewmate_generation("Nia", new="s2") is True
+        assert "pending_generation" not in agent_state.get_crewmate_record("Nia", strict=True)
+        # Landed but never finalized (the process died): the next change from
+        # s2 owns s2 first, then stages s3 -- the row on s2 stays covered.
+        assert agent_state.stage_crewmate_generation("Nia", old="s1", new="s2") is True
+        assert agent_state.stage_crewmate_generation("Nia", old="s2", new="s3") is True
+        rec = agent_state.get_crewmate_record("Nia", strict=True)
+        assert rec["generation"] == "s2" and rec["pending_generation"] == "s3"
+        assert agent_state.move_crewmate_generation("Nia", old="s2", new="s3") is True
+        rec = agent_state.get_crewmate_record("Nia", strict=True)
+        assert rec["generation"] == "s3" and "pending_generation" not in rec
+        assert rec["template"] == "t"
+        # Another row's record: neither phase touches it.
+        assert agent_state.move_crewmate_generation("Nia", old="zzz", new="s9") is False
+        assert agent_state.clear_crewmate_record("Nia", generation="s3") is True
+
+
 class TestRosterRendersIdentity:
     @pytest.mark.asyncio
     async def test_gate_migrated_member_shows_its_original_display_name(self, tmp_path: Path):
@@ -631,6 +854,9 @@ class TestRosterRendersIdentity:
         cfg_file = tmp_path / "config.json"
         _write(cfg_file, _legacy_config())
         state = _make_state(tmp_path)
+        # Enrolled under the typed key: the migration re-keys the record with
+        # the row, so the hired member stays on the roster under its id.
+        _enroll(LEGACY_NAME)
         with unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_file):
             async with TestClient(TestServer(_members_app(state))) as client:
                 resp = await client.get("/api/members")
@@ -664,6 +890,7 @@ class TestRosterRendersIdentity:
             workspaces={"default": SimpleNamespace(dir="workspace")},
             default_workspace="default",
         )
+        _enroll("default", "triage")
         with patch("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", return_value=cfg):
             async with TestClient(TestServer(_members_app(state))) as client:
                 rows = {
@@ -1276,6 +1503,7 @@ class TestRosterIdentityIsRedacted:
             workspaces={"default": SimpleNamespace(dir="workspace")},
             default_workspace="default",
         )
+        _enroll("triage")
         with patch("kiro_crew.dashboard.handlers.members.KiroCrewConfig.load", return_value=cfg):
             async with TestClient(TestServer(_members_app(state))) as client:
                 rows = {
@@ -1383,6 +1611,66 @@ class TestMigrationOrderingAndFailures:
         with patch.object(loader, "_reattribute_moved_members", lambda *a, **k: renamed.append(a)):
             KiroCrewConfig.load()
         assert renamed == []
+        assert loader._read_member_moves_marker() == {}
+
+    @pytest.mark.asyncio
+    async def test_a_load_on_the_event_loop_probes_the_pending_record_off_the_loop(
+        self, cfg_path: Path
+    ):
+        """The pending-moves record is a sidecar read of up to 8 MiB. A load on
+        the loop thread with no malformed key of its own must not read it
+        inline: the probe goes to the executor, which replays a pair the record
+        holds (marker cleared off the loop) and, for an empty record, writes
+        nothing and leaves the cache alone."""
+        import asyncio
+        import threading
+
+        from kiro_crew import agent_state
+        from kiro_crew.config import loader
+
+        _write(
+            cfg_path,
+            {"agents": {"default": {"kiro_agent": "kirocrew"}}, "default_agent": "default"},
+        )
+        loop_thread = threading.get_ident()
+        read_on: list[int] = []
+        real_read = agent_state.get_pending_member_moves
+
+        def observing():
+            read_on.append(threading.get_ident())
+            return real_read()
+
+        # An empty record: probed off the loop, no pass, cache untouched.
+        with patch.object(agent_state, "get_pending_member_moves", observing):
+            KiroCrewConfig.load()
+            for _ in range(100):
+                if read_on:
+                    break
+                await asyncio.sleep(0.02)
+        assert read_on and loop_thread not in read_on
+        assert loader._read_member_moves_marker() == {}
+        # A record holding a pair: still never read on the loop; the executor
+        # pass replays what the document vouches for and clears the record.
+        loader._write_member_moves_marker({"ghost member": "default"})
+        read_on.clear()
+        loader._invalidate_config_cache()
+        with patch.object(agent_state, "get_pending_member_moves", observing):
+            KiroCrewConfig.load()
+            for _ in range(200):
+                # Polled through the UNPATCHED reader: the test's own reads are
+                # not the loader's.
+                if real_read() == {} and read_on:
+                    break
+                await asyncio.sleep(0.02)
+        assert read_on and loop_thread not in read_on
+        assert loader._read_member_moves_marker() == {}
+        # Off the loop the probe is inline, as before.
+        loader._write_member_moves_marker({"ghost member": "default"})
+        read_on.clear()
+        loader._invalidate_config_cache()
+        with patch.object(agent_state, "get_pending_member_moves", observing):
+            await asyncio.to_thread(KiroCrewConfig.load)
+        assert read_on and loop_thread not in read_on
         assert loader._read_member_moves_marker() == {}
 
     def test_a_marker_pair_the_document_does_not_vouch_for_renames_nothing(

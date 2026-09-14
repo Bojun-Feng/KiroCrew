@@ -51,7 +51,7 @@ import shutil
 import tempfile
 import threading
 import uuid
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
@@ -134,6 +134,15 @@ class UnknownMemoryStore(ValueError):
 
 class MemberAlreadyExists(UnknownMemoryStore):
     """A member creation lost a race with an existing config entry."""
+
+
+class MemberAdmissionRefused(UnknownMemoryStore):
+    """The caller's own admission check refused the create inside the locked
+    publication: *code* is the machine-readable reason the route answers."""
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def memory_store_name_defect(name: object) -> str | None:
@@ -1335,12 +1344,26 @@ def persist_member_config(
     create: bool = False,
     expected_store=None,
     changed_fields: set[str] | None = None,
+    admit: Callable[[dict], None] | None = None,
+    after_write: Callable[[], None] | None = None,
 ) -> None:
     """Atomically publish a member and its ownership while retaining other writes.
 
+    *after_write* runs INSIDE the cross-process lock hold once the document is
+    durable (``update_config_locked(after_write=)``): side state that belongs
+    to the row the write just published -- the hire's enrollment record -- is
+    written only after the create guard admitted THIS writer, so a losing
+    concurrent create never writes it, and before any other locked writer
+    (a same-id re-creation, a delete) can run.
+
     Competing creates/initializations of the same member are refused under the
     cross-process config lock. A losing writer can leave an unreferenced empty
-    store, but can neither replace the winner nor adopt another store.
+    store, but can neither replace the winner nor adopt another store. *admit*
+    (create only) is the caller's own admission check, run INSIDE the locked
+    mutation against the document's ``agents`` map as it is on disk at the
+    write -- the one place a check against OTHER rows (a slug shared with a
+    member another process just published) sees what every process did; it
+    raises :class:`MemberAdmissionRefused` to refuse, and nothing is written.
 
     Updates may name only the fields the caller actually changed, preserving
     concurrent edits to other fields. None retains full-record publication;
@@ -1384,6 +1407,8 @@ def persist_member_config(
             raise MemberAlreadyExists(
                 f"Crew Member {member!r} was created concurrently; reload the roster"
             )
+        if create and admit is not None:
+            admit(agents)
         if not create and current is None:
             raise UnknownMemoryStore(
                 f"Crew Member {member!r} was removed concurrently; reload the roster"
@@ -1426,7 +1451,9 @@ def persist_member_config(
         agents[member] = {**(current or {}), **agent_record}
         return data
 
-    update_config_locked(mutate=mutate)
+    update_config_locked(
+        mutate=mutate, after_write=(lambda _doc: after_write()) if after_write else None
+    )
     _invalidate_config_cache()
 
 

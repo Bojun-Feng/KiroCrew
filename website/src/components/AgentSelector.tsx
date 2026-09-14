@@ -38,6 +38,10 @@ export interface KiroCrewAgent {
   /** Per-crew avatar override, verbatim from the backend. `{}`/absent means
    *  the face is derived from the crew name; interpreted by ghostTraitsFrom. */
   avatar?: unknown
+  /** Explicit enrollment: true for a hired crewmate (the sealed record), false for an
+   *  agent template or a plain crew a session can run without hiring. The pickers
+   *  group on it; picking a template never creates a crewmate. */
+  crewmate?: boolean
 }
 
 interface Props {

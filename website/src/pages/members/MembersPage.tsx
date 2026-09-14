@@ -330,6 +330,20 @@ export default function MembersPage() {
   const members = rosterQuery.data ?? EMPTY_ROSTER
   const loaded = rosterQuery.data !== undefined || rosterQuery.isError
   const loadError = rosterQuery.data === undefined && rosterQuery.isError
+  // Only for the empty crew: does the registry hold anything besides
+  // `default`? An upgrader whose preview members are now templates lands on
+  // the same "No crewmates yet" as a fresh install; the difference is whether
+  // there is anyone to hire, and that fact lives in the registry (the same
+  // key the crew manager reads), not on the roster.
+  const rosterEmpty = loaded && !loadError && members.length === 0
+  const registryQuery = useQuery<{ agents?: { name: string }[] }>({
+    queryKey: ['kirocrew-agents'],
+    queryFn: () => api.kirocrewAgents(),
+    enabled: rosterEmpty,
+  })
+  const templatesToHire = rosterEmpty
+    ? (registryQuery.data?.agents ?? []).some((a) => a.name !== 'default')
+    : false
   // Identity is the exact crew name (unique in the registry); the slug is not.
   const [activeName, setActiveName] = useState<string>('')
   // The member the LAST open asked for, written synchronously by `activate`.
@@ -1551,9 +1565,17 @@ export default function MembersPage() {
           style={{ scrollbarWidth: 'none' }}
           aria-label={t('pages.membersPage.title')}
         >
-          {loaded && !loadError && members.length === 0 && (
+          {rosterEmpty && (
             <li className="px-4 py-6 text-xs text-muted">
               <p>{t('pages.membersPage.empty_roster')}</p>
+              {templatesToHire && (
+                /* Names the hire path for rows that already exist -- the
+                   upgrader's members, a package's agents: none is gone, each
+                   is a template the button below hires by name. */
+                <p className="mt-1" data-testid="member-empty-templates">
+                  {t('pages.membersPage.empty_roster_templates')}
+                </p>
+              )}
               {/* The copy only says there is no one yet; this button IS the
                   way to change that — the create form, same destination as
                   the header "+". */}
@@ -2524,7 +2546,15 @@ export default function MembersPage() {
               <dt className="w-24 shrink-0 text-muted">
                 {t('pages.membersPage.agent_template')}
               </dt>
-              <dd className="min-w-0 truncate">{active.kiro_agent || t('pages.membersPage.inherited')}</dd>
+              {/* A member bound to its OWN copy names the template the copy came
+                  from ("reviewer — own copy"), not the copy's stem: the stem is
+                  the member id, and reading it here beside the editor's
+                  "reviewer (Customized)" made two answers to one question. */}
+              <dd className="min-w-0 truncate" data-testid="member-config-template">
+                {active.template_origin
+                  ? t('pages.membersPage.own_copy_of', { template: active.template_origin })
+                  : active.kiro_agent || t('pages.membersPage.inherited')}
+              </dd>
             </div>
             <div className="flex gap-2">
               <dt className="w-24 shrink-0 text-muted">{t('pages.membersPage.model')}</dt>

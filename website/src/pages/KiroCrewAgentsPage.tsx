@@ -720,7 +720,7 @@ function CrewCard({ agent, isDefault, shared, onOpen }: {
               member. The chip says "this is an identifier" without a caption. */}
           <div className="flex items-center gap-2 min-w-0">
             <span className={`truncate text-[14px] font-semibold text-text-strong ${memberLabel(agent) === agent.name ? 'font-mono' : ''}`} data-testid="crew-card-label">{memberLabel(agent)}</span>
-            {memberLabel(agent) !== agent.name && <span className="shrink-0 truncate max-w-[40%] rounded border border-border bg-bg-elevated px-1 font-mono text-[11px] text-muted" title={i18nT('pages.membersPage.member_id')} aria-label={`${i18nT('pages.membersPage.member_id')}: ${agent.name}`} data-testid="crew-card-id">{agent.name}</span>}
+            {memberLabel(agent) !== agent.name && <span className="shrink-0 truncate max-w-[40%] rounded border border-border bg-bg-elevated px-1 font-mono text-[11px] text-muted" title={i18nT('pages.kiroCrewAgentsPage.agent_id')} aria-label={`${i18nT('pages.kiroCrewAgentsPage.agent_id')}: ${agent.name}`} data-testid="crew-card-id">{agent.name}</span>}
             {isDefault && <Badge variant="ok" className="shrink-0">{i18nT('pages.kiroCrewAgentsPage.default_2')}</Badge>}
             {agent.source && agent.source !== 'kirocrew' && <SourceBadge source={agent.source} />}
           </div>
@@ -811,7 +811,7 @@ function CrewRow({ agent, isDefault, shared, onOpen }: {
               >
                 {memberLabel(agent)}
               </Clickable>
-              {memberLabel(agent) !== agent.name && <span className="shrink-0 truncate max-w-[30%] rounded border border-border bg-bg-elevated px-1 font-mono text-[11px] text-muted" title={i18nT('pages.membersPage.member_id')} aria-label={`${i18nT('pages.membersPage.member_id')}: ${agent.name}`} data-testid="crew-row-id">{agent.name}</span>}
+              {memberLabel(agent) !== agent.name && <span className="shrink-0 truncate max-w-[30%] rounded border border-border bg-bg-elevated px-1 font-mono text-[11px] text-muted" title={i18nT('pages.kiroCrewAgentsPage.agent_id')} aria-label={`${i18nT('pages.kiroCrewAgentsPage.agent_id')}: ${agent.name}`} data-testid="crew-row-id">{agent.name}</span>}
               {isDefault && <Badge variant="ok" className="shrink-0">{i18nT('pages.kiroCrewAgentsPage.default_2')}</Badge>}
               {agent.source && agent.source !== 'kirocrew' && <SourceBadge source={agent.source} />}
             </div>
@@ -842,6 +842,20 @@ function CrewRow({ agent, isDefault, shared, onOpen }: {
       </TableCell>
     </TableRow>
   )
+}
+
+/** True when a 409 `agent_exists` body says the taken id belongs to a row that
+ *  is NOT a crewmate (`existing.crewmate === false`). Anything else -- no body,
+ *  another code, an older server -- is false, so the caller falls back to the
+ *  plain "already exists" sentence rather than promising a remedy that may not
+ *  apply. */
+export function collidesWithSessionAgent(body: string): boolean {
+  try {
+    const parsed = JSON.parse(body) as { code?: unknown; existing?: { crewmate?: unknown } }
+    return parsed.code === 'agent_exists' && parsed.existing?.crewmate === false
+  } catch {
+    return false
+  }
 }
 
 export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } = {}) {
@@ -1246,18 +1260,36 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   }, [refetchWorkspaces])
 
   const createMut = useMutation({
-    mutationFn: ({ epoch: _epoch, ...data }: CreatePayload & { epoch: number }) => api.createKirocrewAgent(data),
+    // Two verbs behind one form. From the crew manager the form CREATES a
+    // crew: a plain row bound to a shared template, a session agent. From the
+    // Crew page ("Add a Crewmate") it HIRES: the same fields -- the template
+    // picked, the name typed, Hire pressed -- go to POST /api/members, which
+    // copies the template into the crewmate's own definition, gives it private
+    // memory and enrolls it, so the roster the form returns to actually lists
+    // what was just added. A plain create there would land on a Crew page that
+    // omits the row and says it is not on the roster.
+    mutationFn: ({ epoch: _epoch, ...data }: CreatePayload & { epoch: number }) =>
+      fromMembers
+        ? api.hireMember({
+            source: { kind: 'local', agent: data.kiro_agent },
+            display_name: data.name,
+            role: data.role,
+            workspace: data.workspace,
+            triggers: data.triggers,
+            session_color: data.session_color,
+          }).then((r): AgentMutationResult => ({ error: r.error, name: r.id }))
+        : api.createKirocrewAgent(data),
     onSuccess: (r: AgentMutationResult, vars) => {
       refetchAgents()
-      // The Members roster sent the user here to add a member; the member now
-      // exists, so the next step they want is its thread, not the crew list.
-      // Only for the panel the write was fired from (see settleFor). Exact
-      // name, not slug — MembersPage's `?member=` resolves by name.
+      // The Crew page sent the user here to add a crewmate; the crewmate now
+      // exists and is enrolled, so the next step they want is its thread, not
+      // the crew list. Only for the panel the write was fired from (see
+      // settleFor).
       if (fromMembers && !r.error && vars.epoch === sheetEpoch.current) {
         dismissSheet()
-        // By the MINTED id the server answered with, not the typed text: for
+        // By the MINTED id the hire answered with, not the typed text: for
         // "case competition" the id is "case-competition", and the roster's
-        // `?member=` resolves by id. A pre-split gateway echoes the name.
+        // `?member=` resolves by id.
         navigate(`/members?member=${encodeURIComponent(r.name || vars.name)}`)
         return
       }
@@ -1265,11 +1297,23 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     },
     onError: (e: Error, vars) => {
       // The server's wording is the crew manager's ("Agent 'x' already
-      // exists"); inside the member-titled form the same outcome is said in
-      // the form's own word. 409 is the create route's one "name taken"
-      // answer, so the status is the signal, not the message text.
+      // exists"); inside the crewmate-titled form the same outcome is said in
+      // the form's own word. 409 is the one "name taken" answer of both the
+      // create and the hire, so the status is the signal, not the message text.
       if (fromMembers && e instanceof ApiError && e.status === 409) {
-        settleFor(vars.epoch, i18nT('pages.kiroCrewAgentsPage.member_already_exists', { name: vars.name }))
+        // The 409 names the colliding row's KIND (`existing.crewmate`). "A
+        // crewmate named X already exists" is false when X is a plain crew or
+        // a template the upgrade left un-enrolled -- the upgrader hiring their
+        // own agent under its own name, the most natural input after the empty
+        // roster said "hire one by name" -- and that case has a remedy worth
+        // naming. Unknown kind (an older body, a slug collision) keeps the
+        // plain sentence.
+        settleFor(
+          vars.epoch,
+          collidesWithSessionAgent(e.body)
+            ? i18nT('pages.kiroCrewAgentsPage.member_id_taken_by_agent', { name: vars.name })
+            : i18nT('pages.kiroCrewAgentsPage.member_already_exists', { name: vars.name }),
+        )
         return
       }
       settleFor(vars.epoch, e.message || (fromMembers ? i18nT('pages.kiroCrewAgentsPage.failed_to_create_member') : i18nT('pages.kiroCrewAgentsPage.failed_to_create_agent')))
@@ -2046,9 +2090,14 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
             />
           )}
           <div className="flex-1" />
+          {/* The crew manager's own create, in ITS page's vocabulary: an agent.
+              "Add a Crewmate" belongs to the Crew page's door, whose form hires;
+              this button creates a plain crew that enrolls nobody, and a
+              crewmate label on it promised a teammate that never reached the
+              roster. */}
           <SendBtn onClick={openCreate} data-testid="new-crew">
             <Plus className="lucide-inline" aria-hidden="true" />
-            {i18nT('pages.kiroCrewAgentsPage.add_crew_member')}
+            {i18nT('pages.kiroCrewAgentsPage.add_agent')}
           </SendBtn>
         </div>
 
@@ -2121,13 +2170,13 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
             ))}
             <Clickable
               onClick={openCreate}
-              aria-label={i18nT('pages.kiroCrewAgentsPage.add_crew_member')}
+              aria-label={i18nT('pages.kiroCrewAgentsPage.add_agent')}
               className="flex min-h-[150px] flex-col items-center justify-center gap-2 rounded-lg border
                          border-dashed border-border-strong text-muted transition-colors focus-ring
                          hover:border-accent hover:bg-accent-subtle hover:text-accent"
             >
               <Plus className="lucide-inline" aria-hidden="true" />
-              <span className="text-[13px]">{i18nT('pages.kiroCrewAgentsPage.add_crew_member')}</span>
+              <span className="text-[13px]">{i18nT('pages.kiroCrewAgentsPage.add_agent')}</span>
             </Clickable>
           </div>
         )}
@@ -2141,11 +2190,12 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
              accessible name on its own — it has to say what you are doing to it.
              An explicit aria-label outranks Radix's aria-labelledby, and the
              DialogTitle still has to EXIST or Radix warns. */
-          /* Asked for from the Crew Members roster, the form speaks that
-             page's vocabulary: "Add crew member", the action the user pressed,
-             not "Create Agent" — the app never says the two are one thing. */
+          /* Asked for from the Crew page, the form speaks that page's
+             vocabulary -- "Add a Crewmate", the action the user pressed, and it
+             hires; opened from this page it is "Add an agent" and creates a
+             plain crew. The app never says the two are one thing. */
           aria-label={creating
-            ? i18nT('pages.kiroCrewAgentsPage.add_crew_member')
+            ? i18nT(fromMembers ? 'pages.kiroCrewAgentsPage.add_crew_member' : 'pages.kiroCrewAgentsPage.add_agent')
             : i18nT('pages.kiroCrewAgentsPage.edit_crew_named', { name: editing })}
           /* Radix closes on an outside pointerdown and on Escape. Dismissing
              mid-write is DELIBERATELY still allowed: the sheetEpoch/settleFor
@@ -2188,9 +2238,9 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                 </CrewAvatarButton>
               )}
               <DialogTitle className={creating || !editingAgent?.display_name || editingAgent.display_name === editing ? 'flex-1 font-mono' : 'flex-1'}>
-                {creating ? i18nT('pages.kiroCrewAgentsPage.add_crew_member') : (editingAgent?.display_name || editing)}
+                {creating ? i18nT(fromMembers ? 'pages.kiroCrewAgentsPage.add_crew_member' : 'pages.kiroCrewAgentsPage.add_agent') : (editingAgent?.display_name || editing)}
                 {!creating && editingAgent?.display_name && editingAgent.display_name !== editing && (
-                  <span className="ml-2 rounded border border-border bg-bg-elevated px-1 font-mono text-[12px] font-normal text-muted" title={i18nT('pages.membersPage.member_id')} aria-label={`${i18nT('pages.membersPage.member_id')}: ${editing}`} data-testid="crew-editor-id">{editing}</span>
+                  <span className="ml-2 rounded border border-border bg-bg-elevated px-1 font-mono text-[12px] font-normal text-muted" title={i18nT('pages.kiroCrewAgentsPage.agent_id')} aria-label={`${i18nT('pages.kiroCrewAgentsPage.agent_id')}: ${editing}`} data-testid="crew-editor-id">{editing}</span>
                 )}
               </DialogTitle>
               {!creating && editingAgent?.source && <SourceBadge source={editingAgent.source} />}

@@ -693,6 +693,16 @@ class TestMemberMemoryUserFlows:
             assert response.status == 200, await response.text()
             result = await response.json()
             assert result["new_conversation_required"] is True
+            # The DM thread is a crewmate route: the row is enrolled on the
+            # private store the opt-in just provisioned (explicit enrollment).
+            from kiro_crew import agent_state
+
+            agent_state.set_crewmate_record(
+                "reviewer",
+                generation=KiroCrewConfig.load().agents["reviewer"].memory_store,
+                template="t",
+                hired_at="",
+            )
             response = await client.post("/api/members/reviewer/thread")
             assert response.status == 200, await response.text()
             new_slot_key = (await response.json())["slot_key"]

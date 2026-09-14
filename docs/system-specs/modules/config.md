@@ -1860,8 +1860,10 @@ inside the member-id grammar (`member_identity.MEMBER_ID_RE`, pinned byte-equal 
 `validation._AGENT_NAME_RE`, the grammar every keyed subsystem -- member dir, DM
 binding, slot `agent`, cron `agent`, governance identity -- already enforces). What
 a person reads and renames is `display_name` (free text, `""` = same as the id) plus
-`role` (job title). `member_identity.py` is a leaf module (no `kiro_crew.config`
-import) because the loader calls it during `load()`.
+`role` (job title). There is no flag for HOW a member was named: every name is a
+person's -- the plain create's user typed it and the hire refuses a body without
+one (see `crew-mode.md`, Hire). `member_identity.py` is a leaf module (no
+`kiro_crew.config` import) because the loader calls it during `load()`.
 
 - **Create** (`POST /api/agents`): the typed name is only ever the display name; the
   id is minted from it inside the config lock (`mint_member_id`). For a name inside
@@ -1901,8 +1903,13 @@ import) because the loader calls it during `load()`.
 
 **`MIGRATE_MEMBER_IDS` (write-back migration).** A row whose key is outside the
 grammar -- the `case competition` incident: created, stored, and silently filtered
-out of every roster because a key with a space cannot address anything -- is re-keyed
-to a minted id with the typed string kept as `display_name`. Both halves call ONE
+out of every roster because a key with a space cannot address anything -- OR whose
+key reads as sensitive text although it is grammar-valid (an AWS access key id is 20
+alphanumerics, a valid member id by shape) is re-keyed to a minted id with the typed
+string kept as `display_name`. One predicate, `_is_settled_member_id` (in the grammar
+AND not `carries_sensitive_text`), decides every migration question -- which keys
+move, which count as taken, which overlay keys follow a base row -- so a
+credential-shaped key is never left as the id on the strength of its shape. Both halves call ONE
 function, `_rekey_malformed_member_ids`, so they cannot mint differently: the
 in-memory half on the parsed `cfg.agents` at every load, the on-disk half on the raw
 document inside `_apply_document_migrations` (re-decided against the document under
