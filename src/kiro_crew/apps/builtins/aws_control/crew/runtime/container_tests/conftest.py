@@ -151,6 +151,48 @@ if _declined is not None:  # pragma: no cover - decided by the host, not by a br
     collect_ignore_glob = ["test_*.py"]
 
 
+class _DeclinedModule(pytest.Module):
+    """A test module of this suite, collected while the suite is declined.
+
+    Reports itself as one module-level skip that names the reason, instead of
+    importing anything. See ``pytest_pycollect_makemodule`` for why this exists
+    alongside ``collect_ignore_glob``.
+    """
+
+    def collect(self):  # type: ignore[override]
+        pytest.skip(f"crew container suite declined: {_declined}", allow_module_level=True)
+
+
+def pytest_pycollect_makemodule(module_path: Path, parent: pytest.Collector):
+    """Make the decline hold for a file pytest was handed EXPLICITLY.
+
+    ``collect_ignore_glob`` above governs directory collection only. A path given on
+    the command line is an initial path, and pytest collects initial paths without
+    consulting ``collect_ignore`` or ``pytest_ignore_collect`` -- deliberately, so a
+    user who names a file gets that file. The reduced backend scope on a
+    frontend-only diff does exactly that: ``scripts/ci-surface-tests.py`` hands
+    every cross-surface test file to pytest by path, and a module of this suite is
+    on that list whenever its source happens to match the selector. It is then
+    collected in the app's own CI environment, which does not carry the image's
+    runtime deps, and fails on the first ``container.front`` import it reaches --
+    at collection when that import is at module top level, inside one test when it
+    is lazy. Either way the shard reddens for a dependency the conftest had already
+    decided is absent.
+
+    This hook is the one collection step an initial path cannot bypass: it is how
+    pytest turns any ``.py`` path into a Module. While the suite is declined it
+    answers with a module that skips itself, so the explicit-path route and the
+    directory route agree, for every module of this suite and for any import a
+    module may gain later. Nothing changes where the deps are installed, and under
+    ``_REQUIRED`` the decline has already raised before this can run.
+    """
+    if _declined is None or module_path.parent != _HERE:
+        return None
+    if not module_path.name.startswith("test_") or module_path.suffix != ".py":
+        return None
+    return _DeclinedModule.from_parent(parent, path=module_path)
+
+
 def _modules_that_define_tests() -> set[str]:
     """Names of the ``test_*.py`` files beside this one that define a test function.
 
