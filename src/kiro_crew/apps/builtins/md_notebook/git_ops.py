@@ -31,7 +31,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Iterator, Optional
 
 from kiro_crew import platform_compat
-from kiro_crew.git_worktree_scope import worktree_scope_active
+from kiro_crew.git_worktree_scope import worktree_probe_failure_is_empty_scope
 
 logger = logging.getLogger(__name__)
 
@@ -900,19 +900,7 @@ async def repo_supplied_driver(dir_: str) -> str:
         check=False,
     )
     if code == 0 and out.strip().lower() == "true":
-        # The --worktree scope is probed only when git will actually read it:
-        # the shared decision in kiro_crew.git_worktree_scope explains why a
-        # missing config.worktree is an EMPTY scope, not an unreadable one,
-        # and why an unlocatable git dir keeps the scope in (the listing
-        # below then fails closed as "unprobeable config"). The decision
-        # stats the filesystem, so it runs off the event loop.
-        code, out, _ = await run_git(
-            ["rev-parse", "--absolute-git-dir"], dir_, check=False
-        )
-        if await asyncio.to_thread(
-            worktree_scope_active, out if code == 0 else "", dir_
-        ):
-            scopes.append("--worktree")
+        scopes.append("--worktree")
 
     for scope in scopes:
         code, out, err = await run_git(
@@ -923,6 +911,21 @@ async def repo_supplied_driver(dir_: str) -> str:
             # the probe itself failed and we cannot clear the repo.
             if out.strip() == "" and err.strip() == "":
                 continue
+            if scope == "--worktree":
+                # Probe-first, classify after: git creates config.worktree
+                # lazily, so a probe that failed on a genuinely ABSENT file is
+                # the empty scope, not an unreadable one (the shared decision
+                # in kiro_crew.git_worktree_scope). The classification stats
+                # the filesystem, so it runs off the event loop.
+                gd_code, gd_out, _ = await run_git(
+                    ["rev-parse", "--absolute-git-dir"], dir_, check=False
+                )
+                if await asyncio.to_thread(
+                    worktree_probe_failure_is_empty_scope,
+                    gd_out if gd_code == 0 else "",
+                    dir_,
+                ):
+                    continue
             return "unprobeable config"
         for key in out.splitlines():
             k = key.strip().lower()

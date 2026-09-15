@@ -74,7 +74,7 @@ import subprocess
 from aiohttp import web
 
 from kiro_crew.dashboard.chat_handlers import deny_non_dashboard_caller
-from kiro_crew.git_worktree_scope import worktree_scope_active
+from kiro_crew.git_worktree_scope import worktree_probe_failure_is_empty_scope
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.sandbox import run_limited, sandboxed_spawn_argv
 from kiro_crew.security import is_sensitive_path
@@ -370,27 +370,36 @@ def _worktree_branches(root: str) -> dict[str, str] | None:
     return trees
 
 
-def _worktree_config_active(root: str) -> bool:
-    """True when this repo has a *worktree-scoped* config file git will read.
+def _worktree_extension_on(root: str) -> bool:
+    """True when ``extensions.worktreeConfig`` is enabled for this repo.
 
-    ``extensions.worktreeConfig=true`` makes git load ``$GIT_DIR/config.worktree``
-    in addition to ``.git/config``. ``$GIT_DIR`` is **per worktree**: the common
-    dir for the main worktree, but ``$GIT_COMMON_DIR/worktrees/<id>`` for a linked
-    one — so ``--git-common-dir`` misses a linked worktree's own file entirely
-    (verified: a filter declared there executed during checkout while the common
-    dir had no ``config.worktree`` at all). ``--absolute-git-dir``
-    resolves the right directory in both cases.
-
-    Both conditions matter: without the extension git ignores the file, and with
-    the extension but no file ``git config --worktree --list`` exits 128 ("unable
-    to read config file") — so probing unconditionally would refuse every repo
-    that merely enables the extension.
+    Without the extension git ignores ``$GIT_DIR/config.worktree`` entirely, so
+    the ``--worktree`` config scope is never live and is not probed. With it on
+    the scope IS probed — unconditionally. Whether the file exists is decided
+    only AFTER a probe fails (:func:`_worktree_probe_failure_is_empty_scope`):
+    an existence pre-check would drop the scope on a stale fact and never look
+    at a file git goes on to read.
     """
     ext = _run_git(["config", "--bool", "--get", "extensions.worktreeConfig"], root)
-    if ext.returncode != 0 or ext.stdout.strip() != "true":
-        return False
+    return ext.returncode == 0 and ext.stdout.strip() == "true"
+
+
+def _worktree_probe_failure_is_empty_scope(root: str) -> bool:
+    """True when a failed ``--worktree`` probe hit the empty scope git creates lazily.
+
+    Called only AFTER ``git config --worktree ...`` exited non-zero. ``$GIT_DIR``
+    is **per worktree**: the common dir for the main worktree, but
+    ``$GIT_COMMON_DIR/worktrees/<id>`` for a linked one — so ``--git-common-dir``
+    misses a linked worktree's own file entirely (verified: a filter declared
+    there executed during checkout while the common dir had no
+    ``config.worktree`` at all). ``--absolute-git-dir`` resolves the right
+    directory in both cases. The classification itself is the shared decision in
+    :func:`kiro_crew.git_worktree_scope.worktree_probe_failure_is_empty_scope`.
+    """
     gitdir = _run_git(["rev-parse", "--absolute-git-dir"], root)
-    return worktree_scope_active(gitdir.stdout if gitdir.returncode == 0 else "", root)
+    return worktree_probe_failure_is_empty_scope(
+        gitdir.stdout if gitdir.returncode == 0 else "", root
+    )
 
 
 def _checkout_filter(root: str) -> str:
@@ -403,7 +412,7 @@ def _checkout_filter(root: str) -> str:
     a config file (never from ``.gitattributes``, and never from a remote — clone
     does not transfer config), so the repository-scoped sources are the two
     config scopes git reads from inside the repo: ``--local`` (``.git/config``)
-    and, when :func:`_worktree_config_active`, ``--worktree``
+    and, when :func:`_worktree_extension_on`, ``--worktree``
     (``$GIT_DIR/config.worktree``, per-worktree). Probing only ``--local`` was a real
     hole: ``git config --local --name-only --list`` does NOT report
     worktree-scoped keys, so a repo with ``extensions.worktreeConfig=true`` and
@@ -425,11 +434,18 @@ def _checkout_filter(root: str) -> str:
     repository supplies.
     """
     scopes = ["--local"]
-    if _worktree_config_active(root):
+    if _worktree_extension_on(root):
         scopes.append("--worktree")
     for scope in scopes:
         proc = _run_git(["config", scope, "--includes", "--name-only", "--list"], root)
         if proc.returncode != 0:
+            # Probe-first, classify after: git creates config.worktree lazily,
+            # so a --worktree probe that failed on a genuinely ABSENT file is
+            # the empty scope, not an unreadable one. Every other failure —
+            # this scope with the file present, or any --local failure —
+            # refuses: the repo cannot be proven filter-free.
+            if scope == "--worktree" and _worktree_probe_failure_is_empty_scope(root):
+                continue
             return _FILTER_PROBE_FAILED
         for key in proc.stdout.splitlines():
             key = key.strip()

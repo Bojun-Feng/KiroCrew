@@ -70,7 +70,7 @@ from kiro_crew.dashboard.state import (
     append_and_surface,
 )
 from kiro_crew.doc_parser import extract_text
-from kiro_crew.git_worktree_scope import worktree_scope_active
+from kiro_crew.git_worktree_scope import worktree_probe_failure_is_empty_scope
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes, safe_read_prefix
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.outbound_files import OutboundFile
@@ -5148,26 +5148,25 @@ _GIT_FILTER_KEY_RE = re.compile(
 )
 
 
-def _worktree_config_scope_active(git_cmd: list[str], base: str, env: dict) -> bool:
-    """True when git will actually read a ``--worktree`` config scope here.
+def _worktree_probe_failure_is_empty_scope(
+    git_cmd: list[str], base: str, env: dict
+) -> bool:
+    """True when a failed ``--worktree`` probe hit the empty scope git creates lazily.
 
-    Runs this handler's two probes through its own bounded runner and feeds
-    the results to :func:`kiro_crew.git_worktree_scope.worktree_scope_active`,
-    the one shared decision all four filter-driver guards use. See that
-    module's docstring for why a missing ``config.worktree`` is an EMPTY
-    scope, not an unreadable one.
+    Called only AFTER ``git config --worktree ...`` exited non-zero — never to
+    gate whether that probe runs. Resolves ``$GIT_DIR`` through this handler's
+    own bounded runner and feeds it to
+    :func:`kiro_crew.git_worktree_scope.worktree_probe_failure_is_empty_scope`,
+    the one shared classification all four filter-driver guards use. See that
+    module's docstring for why the probe-first order is the contract.
     """
-    ext_rc, ext_out, _ = _run_git_bounded(
-        [*git_cmd, "config", "--bool", "--get", "extensions.worktreeConfig"],
-        cwd=base, env=env, timeout=5,
-    )
-    if ext_rc != 0 or ext_out.strip() != "true":
-        return False
     gitdir_rc, gitdir_out, _ = _run_git_bounded(
         [*git_cmd, "rev-parse", "--absolute-git-dir"],
         cwd=base, env=env, timeout=5,
     )
-    return worktree_scope_active(gitdir_out if gitdir_rc == 0 else "", base)
+    return worktree_probe_failure_is_empty_scope(
+        gitdir_out if gitdir_rc == 0 else "", base
+    )
 
 
 def _repo_declares_filter_driver(git_cmd: list[str], base: str, env: dict) -> bool:
@@ -5176,20 +5175,27 @@ def _repo_declares_filter_driver(git_cmd: list[str], base: str, env: dict) -> bo
 
     Mirrors ``worktree.py::_checkout_filter``: drivers can only come from a
     config file the repository supplies — ``--local`` (``.git/config``) and,
-    when ``extensions.worktreeConfig`` is on AND ``$GIT_DIR/config.worktree``
-    exists, ``--worktree``. The existence gate matters: git creates that file
-    lazily, so a repo with the extension on but no file yet is filter-free in
-    that scope, and probing it would exit 128 and falsely refuse.
+    when ``extensions.worktreeConfig`` is on, ``--worktree``
+    (``$GIT_DIR/config.worktree``). The worktree scope is PROBED FIRST and a
+    failure classified AFTERWARDS: git creates ``config.worktree`` lazily, so
+    a probe that failed because the file is genuinely absent is the empty
+    scope, not an unreadable one — while an existence pre-check would drop
+    the scope on a stale fact and never look at a file git goes on to read.
     ``--includes`` is mandatory: a specific-scope
     query defaults include-following OFF, so a driver reached through
     ``include.path`` would be invisible to the probe yet still execute.
     Global/system config is deliberately not probed (the user's own machine
-    setup, e.g. ``git lfs install``, is not repository-supplied). A probe that
-    fails refuses: an unreadable scope cannot be proven filter-free. The probe
-    itself is safe — ``git config`` reads files and never runs drivers.
+    setup, e.g. ``git lfs install``, is not repository-supplied). Any other
+    probe failure refuses: an unreadable scope cannot be proven filter-free.
+    The probe itself is safe — ``git config`` reads files and never runs
+    drivers.
     """
     scopes = ["--local"]
-    if _worktree_config_scope_active(git_cmd, base, env):
+    ext_rc, ext_out, _ = _run_git_bounded(
+        [*git_cmd, "config", "--bool", "--get", "extensions.worktreeConfig"],
+        cwd=base, env=env, timeout=5,
+    )
+    if ext_rc == 0 and ext_out.strip() == "true":
         scopes.append("--worktree")
     for scope in scopes:
         rc, out, _ = _run_git_bounded(
@@ -5197,6 +5203,10 @@ def _repo_declares_filter_driver(git_cmd: list[str], base: str, env: dict) -> bo
             cwd=base, env=env, timeout=5,
         )
         if rc != 0:
+            if scope == "--worktree" and _worktree_probe_failure_is_empty_scope(
+                git_cmd, base, env
+            ):
+                continue
             return True
         for key in out.splitlines():
             if _GIT_FILTER_KEY_RE.match(key.strip()):
