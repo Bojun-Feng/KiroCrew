@@ -18,7 +18,7 @@
 import { chromium } from 'playwright'
 import { mkdirSync } from 'node:fs'
 import { serveDist } from './lib/serve-dist.mjs'
-import { logPageProblems, stubDashboardApi } from './lib/stub-dashboard-api.mjs'
+import { logPageProblems, stubDashboardApi, json } from './lib/stub-dashboard-api.mjs'
 
 const OUT = process.argv[2] || '../temp-screenshots/folder-modal'
 const PREFIX = process.argv[3] || 'after'
@@ -30,9 +30,13 @@ mkdirSync(OUT, { recursive: true })
 const folders = [
   { id: 'f1', name: 'Kiro', icon: '🚀', order: 0, collapsed: false, project_dir: '/Volumes/workplace/KiroCrew' },
   { id: 'f1a', name: 'Backend', icon: '🧩', order: 0, collapsed: false, parent_id: 'f1' },
-  { id: 'f2', name: 'Payments', icon: '🎯', order: 1, collapsed: true, project_dir: '/repo/payments', default_agent: 'kirocrew-dev' },
-  // f3's default agent is not in the stubbed roster (see stub-dashboard-api's
-  // /api/agents fixture), so its Folder settings render the orphan state: the
+  // f2's default agent IS in the stubbed /api/agents roster ('kirocrew'), so its
+  // Folder settings render the INSTALLED-agent else-branch: the plain helper hint
+  // and no orphan notice. This is the counterpart to f3's orphan state below, and
+  // the frame that demonstrates the notice is shown only when the agent is missing.
+  { id: 'f2', name: 'Payments', icon: '🎯', order: 1, collapsed: true, project_dir: '/repo/payments', default_agent: 'kirocrew' },
+  // f3's default agent is not in the roster (see the /api/agents override in
+  // main()), so its Folder settings render the orphan state: the
   // "(not installed)" option label AND the inline notice bound to the field.
   { id: 'f3', name: 'Retired', icon: '📦', order: 2, collapsed: true, project_dir: '/repo/retired', default_agent: 'retired-agent' },
 ]
@@ -59,7 +63,25 @@ async function main() {
   })
   const page = await context.newPage()
 
-  await stubDashboardApi(page, { folders, slots })
+  // The shared stub answers /api/agents with a bare ARRAY, but useAgents (via
+  // api.kirocrewAgents) reads `d.agents` / `d.default_agent` off an OBJECT, so
+  // under the array shape `d.agents` is undefined, the roster is empty, and
+  // every folder's default agent reads as an orphan -- which made the
+  // installed-agent (no-notice) state unreachable in a shot. Override the shape
+  // HERE rather than in the shared stub, which 200+ other harnesses depend on.
+  const agentsRoster = {
+    agents: [{ name: 'kirocrew', source: 'builtin' }, { name: 'oncall', source: 'aim' }],
+    default_agent: 'kirocrew',
+  }
+  const extra = async (path, route) => {
+    if (path === '/api/agents' || path === '/api/chat/agents') {
+      json(route, agentsRoster)
+      return true
+    }
+    return false
+  }
+
+  await stubDashboardApi(page, { folders, slots, extra })
   logPageProblems(page)
 
   await page.goto(base + '/chat', { waitUntil: 'domcontentloaded' })
@@ -105,9 +127,18 @@ async function main() {
   await closeModal()
 
   // ── 04: edit an existing folder via ⋯ → Folder settings ──
+  // f2's default agent ('kirocrew') IS installed, so this frame demonstrates the
+  // orphanAgent-toggle's else-branch: the plain Default agent hint with NO notice.
+  // Assert the notice is absent so the frame proves the installed state rather
+  // than merely not erroring.
   await page.hover('[data-testid="folder-collapse-f2"]')
   await page.click('[data-testid="folder-menu-f2"]')
   await page.click('[data-testid="folder-settings-f2"]')
+  await page.waitForSelector(MODAL, { timeout: 5000 })
+  await page.waitForTimeout(400)
+  if (await page.locator('[data-testid="folder-config-agent-notice"]').count() !== 0) {
+    throw new Error('frame 04 expected an INSTALLED default agent (no orphan notice), but the notice rendered')
+  }
   await shotModal(`${PREFIX}-04-edit-folder-settings`)
   await closeModal()
 
