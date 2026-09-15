@@ -215,6 +215,39 @@ def test_connections_all_is_additive_only_over_the_base() -> None:
     assert missing == set(), f"an existing connections export was removed: {sorted(missing)}"
 
 
+def test_control_plane_symbols_live_on_the_canonical_subpackage_only() -> None:
+    # The control-plane symbols are consumed via the canonical
+    # `kiro_crew.connections.control_plane` path (that is what W02/L02 import),
+    # so they are NOT re-exported as top-level `kiro_crew.connections` aliases:
+    # a second spelling with zero consumers is a rename hazard, not a
+    # convenience. The subpackage itself must stay importable (it is a package,
+    # not an alias), and every symbol must be reachable through it.
+    from kiro_crew.connections import control_plane
+
+    canonical_symbols = (
+        "CREDENTIAL_MODES",
+        "ERROR_CLASSES",
+        "CredentialMode",
+        "Effect",
+        "ErrorClass",
+        "OperationContext",
+        "OperationDescriptor",
+        "OperationError",
+        "OperationKind",
+        "OperationResult",
+        "ResultStatus",
+        "ServiceId",
+        "operation_error",
+        "redacted_detail",
+    )
+    for name in canonical_symbols:
+        assert hasattr(control_plane, name), f"{name} missing from the canonical subpackage"
+        assert name not in connections.__all__, f"{name} must not be a top-level alias"
+        assert not hasattr(
+            connections, name
+        ), f"{name} must not be attribute-reachable at top level"
+
+
 def test_registration_mode_api_is_untouched() -> None:
     # Axis A stays exactly where it was; the seam adds Axis B without moving it.
     assert connections.AUTH_MODE_DCR == "dcr"
