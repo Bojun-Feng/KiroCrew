@@ -2413,6 +2413,16 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
 }
 ::highlight(mc-find-current) {
   background-color: var(--search-highlight-current);
+  text-decoration-line: underline;
+  text-decoration-color: var(--search-highlight-current-border);
+  text-decoration-thickness: 2px;
+  text-decoration-skip-ink: none;
+  text-underline-offset: 2px;
+}
+
+/* The passage a comment composer is open over (MarkdownPanel annotation). */
+::highlight(mc-annotate) {
+  background-color: var(--accent-subtle, rgba(99, 102, 241, 0.15));
 }
 
 /* Anchored-comment highlights on the markdown / text artifact body are drawn
