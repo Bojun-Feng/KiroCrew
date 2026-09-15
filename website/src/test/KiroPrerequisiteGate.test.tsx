@@ -54,6 +54,13 @@ function status(overrides: Partial<KiroPrerequisiteStatus> = {}): KiroPrerequisi
   }
 }
 
+// The Pod remedy block is real nested YAML. Matched on the code element's exact
+// text: RTL's default matcher collapses whitespace, which would hide a lost
+// newline or indentation — exactly the defect that makes a paste invalid.
+const POD_YAML = 'securityContext:\n  appArmorProfile:\n    type: Unconfined'
+const podBlock = () =>
+  screen.getByText((_, el) => el?.tagName === 'CODE' && el.textContent === POD_YAML)
+
 describe('KiroPrerequisiteGate', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -1087,6 +1094,75 @@ describe('KiroPrerequisiteGate', () => {
     expect(screen.queryByText(/aa-exec/)).not.toBeInTheDocument()
     // No numerals: a single item must not read as step one of several.
     expect(screen.queryByText('1.')).not.toBeInTheDocument()
+  })
+
+  it('names the container policy and both spellings of the AppArmor switch for a refused mount', async () => {
+    // Issue #10765: a non-root Kubernetes pod granted both namespaces and its
+    // runtime's default AppArmor profile then refused the launcher's first
+    // mount. The probe now names that step, so the gate can say the fix is the
+    // container's policy — not root, not CAP_SYS_ADMIN, not a sysctl — and
+    // spell it for Docker and for a Pod.
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      installed: true,
+      sandbox_unavailable: true,
+      sandbox_failure_kind: 'no_backend',
+      sandbox_detail: 'mount(MS_REC|MS_PRIVATE) on / failed with errno 13 (EACCES)',
+      sandbox_remedy: 'mount_denied',
+    }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    expect(await screen.findByText('How to fix')).toBeInTheDocument()
+    expect(
+      screen.getByText(/--security-opt apparmor=unconfined/),
+    ).toBeInTheDocument()
+    // Real nested YAML, so it drops into a Pod manifest as-is.
+    expect(podBlock()).toBeInTheDocument()
+    // Each block is captioned, so the reader knows which of the two is theirs.
+    expect(screen.getByText('Docker')).toBeInTheDocument()
+    expect(screen.getByText('Kubernetes Pod')).toBeInTheDocument()
+    // Namespaces work here, so the generic "no OS-level sandbox" body would be
+    // false; the container body names what actually refused.
+    expect(screen.queryByText(/provides no OS-level sandbox/)).not.toBeInTheDocument()
+    expect(screen.getByText(/grants the user and mount namespaces/)).toBeInTheDocument()
+    // A host userns remedy would be the wrong fix for a pod that already grants them.
+    expect(screen.queryByText('kirocrew service install')).not.toBeInTheDocument()
+    expect(screen.queryByText(/sysctl/)).not.toBeInTheDocument()
+    expect(screen.getByText('kirocrew doctor')).toBeInTheDocument()
+  })
+
+  it('copies each container spelling on its own', async () => {
+    // Two blocks for one switch, because Docker and a Pod spell it differently;
+    // each must paste as something usable by itself — the Pod block as the
+    // whole nested YAML, newlines included.
+    const { copyToClipboard } = await import('../utils/clipboard')
+    vi.mocked(copyToClipboard).mockClear()
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      installed: true,
+      sandbox_unavailable: true,
+      sandbox_failure_kind: 'no_backend',
+      sandbox_detail: 'mount(MS_REC|MS_PRIVATE) on / failed with errno 13 (EACCES)',
+      sandbox_remedy: 'mount_denied',
+    }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    await screen.findByText('How to fix')
+    fireEvent.click(podBlock().closest('button')!)
+    await waitFor(() =>
+      expect(copyToClipboard).toHaveBeenCalledWith(POD_YAML),
+    )
+    const docker = screen.getByText(/--security-opt apparmor=unconfined/)
+    fireEvent.click(docker.closest('button')!)
+    await waitFor(() =>
+      expect(copyToClipboard).toHaveBeenLastCalledWith(
+        '--security-opt apparmor=unconfined --security-opt seccomp=kirocrew-seccomp.json',
+      ),
+    )
   })
 
   it('still points at doctor when the mechanism is unknown', async () => {
