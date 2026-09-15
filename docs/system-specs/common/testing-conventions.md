@@ -406,6 +406,23 @@ which testpath asked for the workers.
      never move the anchor.** Redirecting a matcher so a test can pass makes it assert
      against a pattern that no longer matches the thing it protects.
 
+- **Tests MUST NOT derive an expected value from the repo's declared version.**
+  `kiro_crew.__version__` is an input the checkout controls, not a constant: a release
+  branch declares `X.Y.Z-rc.N` by contract ([release](../../build/release.md)), a
+  nightly tree carries `.dev<stamp>`, an insider wheel its own suffix. `main` declares
+  a bare release, so an expectation COMPUTED from it is green there and red exactly
+  where a release is decided: `f"{__version__}.12"` for a `BUILD_VERSION` stamp
+  production honours only over a bare numeric base passed on `main` for months while
+  reddening `release.yml`'s `release-candidate-tests` — the same-SHA gate every
+  prerelease tag must clear before a promotion record can be assembled — and every
+  local run and back-to-`main` PR off that branch with it. Pin a synthetic base
+  instead, and when the test synthesizes the package under test, rewrite the literal
+  there so the test owns that input outright (`test/test_build_version_override.py`'s
+  `_PINNED_BASE`). Comparing the SAME live value on both sides is fine and is not this
+  rule — "`--version` reports the string the package declares" IS the contract; it is
+  computing a DIFFERENT string from the live one that assumes a shape no branch
+  guarantees.
+
 - **Never leave the process working directory somewhere else.** The CWD is
   per-PROCESS, so under xdist one test's `os.chdir` becomes every later test's starting
   directory on that worker. Use `monkeypatch.chdir`, which reverts on its own; the
