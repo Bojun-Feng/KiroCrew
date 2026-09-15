@@ -808,6 +808,23 @@ Two things the survey CANNOT tell you, both of which misled the first pass:
   held for the life of the worker is paid by every later test on it. And mark the module
   as one `xdist_group` (see "Keeping the suite fast"): a per-module cache that xdist
   spreads over five workers is warmed five times.
+- **A repo-WIDE corpus scan enumerates via git, never the filesystem.** `rglob` and
+  `os.walk` from the repo root descend every gitignored tree and every checkout nested
+  under it, so a worktree under `.claude/worktrees/` (the Claude Code harness creates
+  them there), a local `.kirocrew-dev/` data home or a scratch clone puts a second copy
+  of every shipped file in front of the gate. That is not only a false positive naming a
+  path the author cannot edit: where the gate asserts `any(...)` over its matches — the
+  coverage omit contract does — a stale copy keeps satisfying it after the real file lost
+  the property, and the gate fails OPEN. Use `source_corpus.repo_files()` /
+  `repo_files_named(...)`, which asks `git ls-files --cached --others --exclude-standard`
+  (untracked-but-not-ignored included, so a new file is policed before it is `git add`ed)
+  and keep the gate's own scope filter — `_vendor` is TRACKED, so git names it just as a
+  walk would. Its no-git fallback is reachable ONLY where there is no `.git` (an sdist) or
+  no git binary: a checkout whose `git` call merely FAILED — a leaked `GIT_DIR`,
+  `safe.directory` — raises instead, because a fallback there answers wider than git and
+  no count floor catches a surplus. Skipping one directory by name is not the fix: the set
+  of nested trees is open, and `test_source_corpus.py` pins the rule instead — no test
+  under `test/` or `scripts/` may root a recursive filesystem scan at the repo root.
 
 The second full-run audit (five backend + five frontend runs against a clean `main`)
 found these further classes. Each one passed on the host that wrote it.
