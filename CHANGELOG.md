@@ -11,45 +11,6 @@ hides reasoning effort behind a drill in, and links you define yourself. Windows
 gets isolated pods and a gateway that starts about four times faster, and a pull
 request watch now covers GitLab, Bitbucket and Azure DevOps as well as GitHub.
 
-### Before you upgrade
-
-- **Two ceilings are now on by default**: an idle session whose process tree
-  passes 1536 MiB is recycled, which `session.watchdog_rss_max_mb` set to 0 in
-  `config.json` disables, and a monitoring loop the agent arms can no longer be
-  unlimited, so one that names no runtime budget stops after four hours.
-- **A watch's wakes are now spaced and then repeated**: a second change arriving
-  within four minutes of the last wake is folded into the next one instead of
-  waking the session at once, and a change still unresolved re-wakes the session
-  every six hours instead of being reported only once, with neither interval
-  configurable.
-- **Five controls are gone**: the Clean option in the new-chat chooser, the Agent
-  Templates tab on Agent Capabilities, Orchestrator Mode and Enforce Denied
-  Commands on the Developer page's Config tab which only appears with Developer
-  Mode on, and the Waiting on you card above the composer.
-- **Two gates tightened**: a scheduled job with a Python script body now runs in
-  the same restricted sandbox command jobs use, so it can no longer read host
-  credential stores except that the AWS credential directory stays readable on
-  macOS, and `ssh`, `scp`, `sftp` and `rsync` aimed back at this same machine are
-  refused by a rule you can switch off under Settings → Security → Denied
-  Commands.
-- **An enabled Dev Fleet now also hands agent sessions the pod controls**: with
-  that app on, an agent can start and stop preview pods itself, which runs code
-  in a worktree outside its own sandbox as you and deletes a pod's own data
-  directory when the agent stops it, so leave the app off under Apps → Library if
-  you do not want that.
-- **Defaults that moved**: spoken replies use the host's own speech engine, which
-  needs `espeak-ng` installed on Linux, unless your configuration already names a
-  Piper model; dictation on the local recogniser detects the spoken language
-  instead of forcing US English; the Connections services gallery ships visible;
-  Apps → Library lists only enabled apps with the rest behind a show disabled
-  toggle; Windows now allows agent subprocesses by default through
-  `agent.sandbox_allow_unsandboxed_exec`; New chat, Close session, shortcuts help
-  and Settings move to the conventional Cmd or Ctrl chords with the old Alt
-  chords aliased for one release only while every other chord is unchanged; and
-  an install still holding the old two hour turn or thirty minute subagent
-  timeout has that stored value dropped on first start so the longer shipped
-  budgets apply.
-
 ### Settings that apply while you work
 
 - **Almost every setting now reaches the running gateway**: saving `config.json`,
