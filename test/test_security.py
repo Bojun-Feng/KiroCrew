@@ -8668,12 +8668,12 @@ class TestSubstitutionBodiesReadFoldedOpeners:
     opener, so ``cat <\\`` + newline + ``(...)`` is a process substitution to bash
     (measured: ``cat <\\<newline>(echo hi)`` prints ``hi``; the ``>\\<newline>(``
     and ``$\\<newline>(`` spellings run their bodies the same way).
-    ``_substitution_bodies`` recognises its openers byte-literally, and the
-    payload walk used to hand it the RAW source, so a continuation inside the
-    opener meant no body was extracted and the inner command was never scanned
-    -- ``cat <\\<newline>(bash -c '<name> <verb>')`` was ALLOWED while bash ran
-    the mint. The walk now reads the bodies from the same quote-aware fold the
-    tokenizer already applies, so the two views agree.
+    ``_substitution_bodies`` recognises its openers byte-literally, so handing it
+    the RAW source extracts no body for a continuation-split opener and the inner
+    command goes unscanned: ``cat <\\<newline>(bash -c '<name> <verb>')`` reads
+    as ALLOWED while bash runs the mint. The payload walk therefore reads the
+    bodies from the same quote-aware fold the tokenizer applies, so the two views
+    agree.
 
     The matrix is the three parenthesised openers x (split opener, split program,
     split verb), each asserted against its unsplit twin, plus the CRLF, real
@@ -8699,7 +8699,7 @@ class TestSubstitutionBodiesReadFoldedOpeners:
 
         The body is a wrapper (``bash -c``) so the inner mint is reachable ONLY
         through the substitution-body walk -- the top-level argv sees one opaque
-        token. This is the spelling that was measured ALLOWED before the fix.
+        token. A raw-source body scan reads this spelling as ALLOWED.
         """
         split = f"cat {opener[0]}\\\n({'bash -c'} '{self._mint()}')"
         plain = f"cat {opener}bash -c '{self._mint()}')"
