@@ -4,7 +4,7 @@ A lesson's identity is the pair ``(rule, repo_scope)``. ``DELETE /api/lessons``
 has accepted a ``repo_scope`` selector since the CLI/MCP fix, but the list the
 dashboard renders from carried no scope at all -- so two same-rule rows in two
 scopes were indistinguishable duplicates in the Memory tab, and the only delete
-the UI could send (no selector) removed both (#10651).
+the UI could send (no selector) removed both.
 
 The list now answers, per row, the selector that names exactly that row under
 the delete route's present-vs-absent semantics:
@@ -146,3 +146,82 @@ async def test_jsonl_rows_carry_the_same_selector_contract(tmp_path) -> None:
     assert state.lessons.remove(RULE, "src/pkg") is True
     remaining = _selectors(await _list(None, state))
     assert set(remaining) == {"", None}, remaining
+
+
+# The two other list surfaces read the same identity and feed the same
+# scope-selective remove, so they render the scope under the same contract.
+
+
+def test_mcp_learn_list_renders_the_scope_beside_the_rule() -> None:
+    from kiro_crew.mcp_tools import learn
+
+    rows = [
+        {"rule": f"{RULE} everywhere", "category": "tool", "repo_scope": ""},
+        {"rule": f"{RULE} in this repo", "category": "tool", "repo_scope": "src/pkg"},
+        {"rule": f"{RULE} nowhere", "category": "tool", "repo_scope": None},
+        # An older gateway that emits no scope at all renders as before.
+        {"rule": f"{RULE} legacy", "category": "tool"},
+    ]
+    with patch.object(learn.mcp_core, "_get", return_value={"lessons": rows}):
+        text = learn.learn_list("learn_list", {})
+    assert text.splitlines() == [
+        f"[tool] {RULE} everywhere",
+        f"[tool] {RULE} in this repo (scope: src/pkg)",
+        f"[tool] {RULE} nowhere (scope: unusable)",
+        f"[tool] {RULE} legacy",
+    ]
+
+
+def test_cli_learn_list_renders_the_scope_for_both_tiers(tmp_path, capsys) -> None:
+    import argparse
+
+    from kiro_crew import cli_commands
+
+    store = _store(tmp_path)
+    try:
+        assert store.write_lesson(f"{RULE} everywhere", "tool")
+        assert store.write_lesson(f"{RULE} in this repo", "tool", repo_scope="src/pkg")
+        assert (
+            store.set_semantic(
+                "lesson.broken",
+                {"rule": f"{RULE} nowhere", "category": "tool", "repo_scope": "/"},
+                1.0,
+                "user_explicit",
+            )
+            is None
+        )
+        args = argparse.Namespace(learn_action="list")
+        with (
+            patch.object(cli_commands, "VectorMemoryStore", return_value=store),
+            patch.object(cli_commands, "LessonStore", return_value=MagicMock()),
+            patch.object(cli_commands.KiroCrewConfig, "load", return_value=MagicMock()),
+        ):
+            cli_commands._learn(args)
+    finally:
+        store.close()
+    out = capsys.readouterr().out
+    assert f"[tool] {RULE} everywhere\n" in out
+    assert f"[tool] {RULE} in this repo (scope: src/pkg)\n" in out
+    assert f"[tool] {RULE} nowhere (scope: unusable)\n" in out
+
+    # JSONL tier: the store the CLI falls back to when the vector tier is empty.
+    lines = [
+        {"ts": "t0", "rule": f"{RULE} everywhere", "category": "tool"},
+        {"ts": "t1", "rule": f"{RULE} in this repo", "category": "tool", "repo_scope": "src/pkg"},
+        {"ts": "t2", "rule": f"{RULE} nowhere", "category": "tool", "repo_scope": "/"},
+    ]
+    (tmp_path / "lessons.jsonl").write_text(
+        "".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8"
+    )
+    empty_vs = MagicMock()
+    empty_vs.get_lessons.return_value = []
+    with (
+        patch.object(cli_commands, "VectorMemoryStore", return_value=empty_vs),
+        patch.object(cli_commands, "LessonStore", return_value=LessonStore(base_dir=tmp_path)),
+        patch.object(cli_commands.KiroCrewConfig, "load", return_value=MagicMock()),
+    ):
+        cli_commands._learn(argparse.Namespace(learn_action="list"))
+    out = capsys.readouterr().out
+    assert f"[tool] {RULE} everywhere\n" in out
+    assert f"[tool] {RULE} in this repo (scope: src/pkg)\n" in out
+    assert f"[tool] {RULE} nowhere (scope: unusable)\n" in out

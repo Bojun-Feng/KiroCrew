@@ -30,6 +30,27 @@ import SortableHeader from '../../components/SortableHeader'
 import { i18nT } from '../../i18n/t'
 import { compareText, fmtDateTimeNumeric } from '../../i18n/format'
 
+/** The Scope cell. The three values are the three delete selectors the list
+ *  reports, and each must read differently: a fragment is that scope's row;
+ *  `""` is the global row, labelled rather than left blank so it does not read
+ *  as missing data beside a scoped sibling; `null` is a row whose stored scope
+ *  the store cannot use, labelled so the reader can see that its Delete is the
+ *  one that reaches every scope. */
+function scopeCell(scope: string | null | undefined) {
+  if (scope === null) return <span className="text-muted italic">{i18nT('pages.overview.memoryTab.scope_unusable')}</span>
+  if (!scope) return <span className="text-muted">{i18nT('pages.overview.memoryTab.scope_global')}</span>
+  return <span className="font-mono">{scope}</span>
+}
+
+/** A `null` scope is the one row whose Delete cannot be limited to itself: the
+ *  route refuses the stored value as a selector, so the client sends none and
+ *  the unselective delete removes every same-rule row in every scope. That is
+ *  the collateral this tab otherwise exists to prevent, so it asks first. */
+function confirmLessonDelete(lesson: Lesson): boolean {
+  if (lesson.repo_scope !== null) return true
+  return window.confirm(i18nT('pages.overview.memoryTab.delete_unusable_scope_confirm'))
+}
+
 export default function MemoryTab({ refreshTrigger, selectedStore, onStoreNavigate }: { refreshTrigger: number; selectedStore?: string; onStoreNavigate?: (store: string) => void }) {
   const stores = useMemoryStores()
   const navigate = useNavigate()
@@ -356,8 +377,8 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
           // Scope is part of the key: a scoped and a global row sharing rule text
           // are two lessons, and can share a timestamp. String() keeps the null
           // (unusable-scope) row distinct from the "" (global) one.
-          <tr key={`${l.rule}-${String(l.repo_scope)}-${l.ts}`} className="hover:bg-bg-hover transition-colors"><td className="px-2.5 py-2 border-b border-border text-sm">{esc(l.rule)}</td><td className="px-2.5 py-2 border-b border-border text-sm"><Badge variant="ok">{l.category}</Badge></td><td className="px-2.5 py-2 border-b border-border text-sm font-mono text-muted">{l.repo_scope || ''}</td><td className="px-2.5 py-2 border-b border-border text-sm">{fmtDateTimeNumeric(l.ts)}</td>
-            <td className="px-2.5 py-2 border-b border-border text-sm"><Btn danger onClick={async () => { await api.deleteLesson(l.rule, l.repo_scope); loadLessons() }}>{i18nT('pages.overview.memoryTab.delete')}</Btn></td></tr>
+          <tr key={`${l.rule}-${String(l.repo_scope)}-${l.ts}`} className="hover:bg-bg-hover transition-colors"><td className="px-2.5 py-2 border-b border-border text-sm">{esc(l.rule)}</td><td className="px-2.5 py-2 border-b border-border text-sm"><Badge variant="ok">{l.category}</Badge></td><td className="px-2.5 py-2 border-b border-border text-sm">{scopeCell(l.repo_scope)}</td><td className="px-2.5 py-2 border-b border-border text-sm">{fmtDateTimeNumeric(l.ts)}</td>
+            <td className="px-2.5 py-2 border-b border-border text-sm"><Btn danger onClick={async () => { if (!confirmLessonDelete(l)) return; await api.deleteLesson(l.rule, l.repo_scope); loadLessons() }}>{i18nT('pages.overview.memoryTab.delete')}</Btn></td></tr>
         ))}</tbody></table></Card>
     )}
   </>)

@@ -443,27 +443,45 @@ describe('MemoryTab — lessons', () => {
         { rule: 'zzq-broken-rule', category: 'tool', ts: '2026-01-03T00:00:00Z', repo_scope: null },
       ],
     })
-    renderWithProviders(<MemoryTab refreshTrigger={0} />)
-    await screen.findByText('src/pkg')
-    // Two rows share the rule; the Scope column is what tells them apart.
-    const sameRule = screen.getAllByText('zzq-same-rule').map((td) => td.closest('tr') as HTMLElement)
-    expect(sameRule).toHaveLength(2)
-    expect(screen.getByRole('columnheader', { name: /Scope/ })).toBeInTheDocument()
-    const scoped = sameRule.find((tr) => tr.textContent?.includes('src/pkg')) as HTMLElement
-    const global = sameRule.find((tr) => !tr.textContent?.includes('src/pkg')) as HTMLElement
-    const deleteIn = (tr: HTMLElement) => Array.from(tr.querySelectorAll('button'))
-      .find((b) => /delete/i.test(b.textContent ?? '')) as HTMLButtonElement
+    const confirmSpy = vi.spyOn(window, 'confirm')
+    try {
+      renderWithProviders(<MemoryTab refreshTrigger={0} />)
+      await screen.findByText('src/pkg')
+      // Two rows share the rule; the Scope column is what tells them apart, and
+      // each of the three selector values reads differently.
+      const sameRule = screen.getAllByText('zzq-same-rule').map((td) => td.closest('tr') as HTMLElement)
+      expect(sameRule).toHaveLength(2)
+      expect(screen.getByRole('columnheader', { name: /Scope/ })).toBeInTheDocument()
+      const scoped = sameRule.find((tr) => tr.textContent?.includes('src/pkg')) as HTMLElement
+      const global = sameRule.find((tr) => !tr.textContent?.includes('src/pkg')) as HTMLElement
+      expect(global).toHaveTextContent(/Global/)
+      const broken = screen.getByText('zzq-broken-rule').closest('tr') as HTMLElement
+      expect(broken).toHaveTextContent(/Unusable scope/)
+      const deleteIn = (tr: HTMLElement) => Array.from(tr.querySelectorAll('button'))
+        .find((b) => /delete/i.test(b.textContent ?? '')) as HTMLButtonElement
 
-    await userEvent.click(deleteIn(scoped))
-    await waitFor(() => expect(api.deleteLesson).toHaveBeenCalledWith('zzq-same-rule', 'src/pkg'))
-    expect(api.deleteLesson).not.toHaveBeenCalledWith('zzq-same-rule', '')
+      // A scoped or global row deletes without a prompt: its selector reaches
+      // exactly that row.
+      await userEvent.click(deleteIn(scoped))
+      await waitFor(() => expect(api.deleteLesson).toHaveBeenCalledWith('zzq-same-rule', 'src/pkg'))
+      expect(api.deleteLesson).not.toHaveBeenCalledWith('zzq-same-rule', '')
+      await userEvent.click(deleteIn(global))
+      await waitFor(() => expect(api.deleteLesson).toHaveBeenCalledWith('zzq-same-rule', ''))
+      expect(confirmSpy).not.toHaveBeenCalled()
 
-    await userEvent.click(deleteIn(global))
-    await waitFor(() => expect(api.deleteLesson).toHaveBeenCalledWith('zzq-same-rule', ''))
-
-    const broken = screen.getByText('zzq-broken-rule').closest('tr') as HTMLElement
-    await userEvent.click(deleteIn(broken))
-    await waitFor(() => expect(api.deleteLesson).toHaveBeenCalledWith('zzq-broken-rule', null))
+      // The null row's delete is the unselective one, so it asks first; a
+      // declined prompt sends nothing, an accepted one sends the null through
+      // (the client drops the key).
+      confirmSpy.mockReturnValueOnce(false)
+      await userEvent.click(deleteIn(broken))
+      expect(confirmSpy).toHaveBeenCalledTimes(1)
+      expect(api.deleteLesson).not.toHaveBeenCalledWith('zzq-broken-rule', null)
+      confirmSpy.mockReturnValueOnce(true)
+      await userEvent.click(deleteIn(broken))
+      await waitFor(() => expect(api.deleteLesson).toHaveBeenCalledWith('zzq-broken-rule', null))
+    } finally {
+      confirmSpy.mockRestore()
+    }
   })
 
   it('shows an empty state rather than a bare table', async () => {
