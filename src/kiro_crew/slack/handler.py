@@ -41,7 +41,12 @@ from kiro_crew.acp.types import (
     STOP_REASON_COMPACTION_FAILED,
     STOP_REASON_END_TURN,
 )
-from kiro_crew.agent_discovery import project_agent_files, project_agent_name
+from kiro_crew.agent_discovery import (
+    agent_spec_stems,
+    project_agent_files,
+    project_agent_name,
+)
+from kiro_crew.agent_spec_format import iter_agent_spec_files
 from kiro_crew.config.loader import (
     ACTIVATION_REVIEW,
     ConfigReadError,
@@ -1036,13 +1041,13 @@ def _resolve_agent_name(name: str, project_dir: str | None = None) -> str | None
         return project_agent_name(spec)
 
     agents_dir = kiro_agents_dir()
-    jsons = (
-        sorted(agents_dir.glob("*.json"), key=lambda f: (len(f.stem), f.stem))
+    specs = (
+        sorted(iter_agent_spec_files(agents_dir), key=lambda f: (len(f.stem), f.stem))
         if agents_dir.is_dir()
         else []
     )
     match = next(
-        (f for f in jsons if f.stem == name or f.stem.endswith(f"-{name}")),
+        (f for f in specs if f.stem == name or f.stem.endswith(f"-{name}")),
         None,
     )
     if not match:
@@ -1121,7 +1126,11 @@ def _list_all_agent_names(cc_plugins_dir: Path | None = None) -> str:
     if agents_dir.is_dir():
         # Hide the internal kirocrew-lite variant from BOTH sources — a
         # ~/.kiro/agents/kirocrew-lite.json would otherwise leak into the list.
-        names.extend(f.stem for f in sorted(agents_dir.glob("*.json")) if f.stem != "kirocrew-lite")
+        names.extend(
+            stem
+            for stem in agent_spec_stems(agents_dir, operation="slack_list_agents", source="slack")
+            if stem != "kirocrew-lite"
+        )
     seen = set(names)
     for agent_name in _iter_cc_agent_names(cc_plugins_dir):
         if agent_name not in seen and agent_name != "kirocrew-lite":

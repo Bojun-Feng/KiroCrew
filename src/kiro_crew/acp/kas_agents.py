@@ -49,13 +49,13 @@ auto-approve input Crew's governance ceiling has filtered.
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
 
 from kiro_crew.acp.kas_permissions import allowed_tools_to_permissions
 from kiro_crew.agent_discovery import AmbiguousAgentSpecError, spec_by_declared_name
+from kiro_crew.agent_spec_format import agent_spec_candidates, parse_agent_spec_text
 from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 from kiro_crew.platform.governance import may_skip_gate_now
 from kiro_crew.security import is_sensitive_path
@@ -551,7 +551,9 @@ def load_agent_spec(agents_dir: Path, agent_id: str) -> dict[str, Any]:
 
     A spec that DECLARES ``name == agent_id`` wins, found through
     :func:`kiro_crew.agent_discovery.spec_by_declared_name`, and
-    ``<agent_id>.json`` is read only when no spec declares the id. That is the
+    ``<agent_id>.json`` or ``<agent_id>.md`` (the markdown form, frontmatter
+    plus a body that is the prompt -- see :mod:`kiro_crew.agent_spec_format`)
+    is read only when no spec declares the id. That is the
     order :func:`kiro_crew.agent.agent_spec_path` and the documented resolution
     convention use, and it is what keeps a misnamed ``<agent_id>.json`` that
     declares some other agent from being projected under this id, with that
@@ -578,7 +580,8 @@ def load_agent_spec(agents_dir: Path, agent_id: str) -> dict[str, Any]:
     function as an ``OSError`` and the conversion is what makes the failure
     uniform.
     """
-    path = agents_dir / f"{agent_id}.json"
+    candidates = agent_spec_candidates(agents_dir, agent_id)
+    path = candidates[0]
     try:
         declared = spec_by_declared_name(
             agents_dir, agent_id, operation="kas_agent_projection", source="unknown"
@@ -589,12 +592,22 @@ def load_agent_spec(agents_dir: Path, agent_id: str) -> dict[str, Any]:
         raise KasAgentTranslationError(f"agent spec {path} is unreadable: {exc}") from exc
     if declared is not None:
         return declared
+    present = [p for p in candidates if p.is_file()]
+    if len(present) > 1:
+        # ``<id>.json`` and ``<id>.md`` side by side, neither declaring the id:
+        # the same agent twice, and which one KAS would have run is undefined.
+        raise KasAgentTranslationError(
+            f"{len(present)} spec files carry the filename {agent_id!r}: "
+            f"{', '.join(repr(str(p)) for p in present)} -- remove or rename one"
+        )
+    if present:
+        path = present[0]
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = parse_agent_spec_text(path.read_text(encoding="utf-8"), path)
     except OSError as exc:
         raise KasAgentTranslationError(f"agent spec {path} is unreadable: {exc}") from exc
     except ValueError as exc:
-        raise KasAgentTranslationError(f"agent spec {path} is not valid JSON: {exc}") from exc
+        raise KasAgentTranslationError(f"agent spec {path} is not a valid spec: {exc}") from exc
     if not isinstance(raw, dict):
         raise KasAgentTranslationError(f"agent spec {path} is not an object")
     return raw

@@ -901,6 +901,9 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         # surface resolves an agent id and finds no ``<agent_id>.json``; it
         # forwards so each such surface attributes its own denials.
         ("forward:operation", "forward:source"),
+        # ``agent_spec_stems`` reads each ``*.md`` to decide whether it is a
+        # spec at all, for the Slack listings; it forwards for the same reason.
+        ("forward:operation", "forward:source"),
         ("list_agents", "unknown"),
         ("list_agents", "unknown"),
         ("resolve_project_agent_name", "unknown"),

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import json
 import logging
 import os
 import threading
@@ -26,6 +25,13 @@ from kiro_crew.agent_files import (
     AGENT_FILENAME,
     LITE_AGENT_FILENAME,
     OWNED_KIRO_AGENT_FILES,
+)
+from kiro_crew.agent_spec_format import (
+    is_agent_spec_name,
+    is_markdown_spec,
+    iter_agent_spec_files,
+    parse_agent_spec_bytes,
+    spec_stem,
 )
 from kiro_crew.config.paths import kiro_agents_dir, project_agents_dir, project_kiro_dir
 from kiro_crew.executors import discovery_executor
@@ -235,10 +241,13 @@ def _read_agent_spec(
 ) -> dict[str, Any] | None:
     """Parse an agent config file, or ``None`` when it is not usable.
 
-    The one reader for both scopes, so every guard applies uniformly: AppleDouble
-    sidecars, a symlink whose RESOLVED target is sensitive (``evil.json`` ->
-    ``~/.aws/credentials``), non-UTF-8 bytes, JSON that is not an object, and
-    oversized files are all rejected. The read itself goes through
+    The one reader for both scopes and both forms (``<name>.json`` and the
+    markdown ``<name>.md`` -- see :mod:`kiro_crew.agent_spec_format`), so every
+    guard applies uniformly: AppleDouble sidecars, a symlink whose RESOLVED
+    target is sensitive (``evil.json`` -> ``~/.aws/credentials``), non-UTF-8
+    bytes, a document that is not an object, and oversized files are all
+    rejected. A markdown file with no frontmatter fence is not a spec and is
+    skipped like malformed JSON. The read itself goes through
     :func:`kiro_crew.hooks.safe_read_file_bytes` — the hardened gate every other
     dashboard file read uses — so a multi-gigabyte "agent config" is refused at
     the size cap instead of being slurped into memory during a cache warm. The
@@ -288,7 +297,7 @@ def _read_agent_spec(
         logger.debug("Skipping unreadable agent config: %s", path)
         return None
     try:
-        data = json.loads(raw.decode("utf-8"))
+        data = parse_agent_spec_bytes(raw, path)
     except (UnicodeDecodeError, ValueError):
         logger.debug("Skipping unreadable agent config: %s", path)
         return None
@@ -363,7 +372,7 @@ def spec_by_declared_name(
     """
     match: dict[str, Any] | None = None
     match_paths: list[Path] = []
-    for path in sorted(agents_dir.glob("*.json")):
+    for path in iter_agent_spec_files(agents_dir):
         spec = _read_agent_spec(path, operation=operation, source=source)
         if isinstance(spec, dict) and spec.get("name") == agent_id:
             if match is None:
@@ -378,6 +387,27 @@ def spec_by_declared_name(
             f"undefined -- remove or rename one."
         )
     return match
+
+
+def agent_spec_stems(agents_dir: Path, *, operation: str, source: str) -> list[str]:
+    """Filename stems of the specs in *agents_dir*, in directory order, deduplicated.
+
+    The cheap listing the Slack surfaces show: every ``*.json`` stem as before,
+    unparseable ones included (a broken JSON spec still occupies its name), plus
+    the stem of each ``*.md`` that PARSES as a spec. A markdown file is a spec
+    only when it opens with a frontmatter fence, so a ``README.md`` dropped into
+    the directory is not listed as an agent; deciding that takes a read, which
+    goes through :func:`_read_agent_spec` under its guards. Propagates
+    ``OSError`` from the directory walk like the glob it replaces.
+    """
+    stems: dict[str, None] = {}
+    for path in iter_agent_spec_files(agents_dir, ordered=False):
+        if is_markdown_spec(path) and (
+            _read_agent_spec(path, operation=operation, source=source) is None
+        ):
+            continue
+        stems.setdefault(path.stem)
+    return list(stems)
 
 
 def _warn_on_systematic_scan_failure(directory: Path, candidates: int, parsed: int) -> None:
@@ -408,9 +438,9 @@ def project_agent_files(
 ) -> list[Path]:
     """Agent config files declared by a project checkout, sorted by stem.
 
-    Returns the kiro-cli-native ``<project>/.kiro/agents/*.json`` — the only project
-    location kiro-cli itself resolves ``--agent`` against, and therefore the only
-    one whose names are dispatchable.
+    Returns the kiro-cli-native ``<project>/.kiro/agents/*.json`` and the markdown
+    ``*.md`` form beside it — the only project location the backends resolve
+    ``--agent`` against, and therefore the only one whose names are dispatchable.
 
     *include_legacy* additionally returns ``<project>/.kiro/*.agent-spec.json``, Kiro
     Crew's own older convention. It defaults to ``False`` because every dispatch
@@ -439,7 +469,7 @@ def project_agent_files(
                 specs.extend(kiro_dir.glob(f"*{AGENT_SPEC_SUFFIX}"))
         agents_dir = project_agents_dir(project_dir)
         if agents_dir.is_dir():
-            specs.extend(agents_dir.glob("*.json"))
+            specs.extend(iter_agent_spec_files(agents_dir))
     except OSError:
         return []
     return sorted(specs, key=lambda f: f.stem)
@@ -448,11 +478,9 @@ def project_agent_files(
 def _project_agent_fallback_name(spec: Path) -> str:
     """The filename-derived name for *spec*, with the spec suffixes stripped."""
     fallback = spec.name
-    for suffix in (AGENT_SPEC_SUFFIX, ".json"):
-        if fallback.endswith(suffix):
-            fallback = fallback[: -len(suffix)]
-            break
-    return fallback
+    if fallback.endswith(AGENT_SPEC_SUFFIX):
+        return fallback[: -len(AGENT_SPEC_SUFFIX)]
+    return spec_stem(fallback)
 
 
 def _declared_project_agent_name(spec: Path) -> str | None:
@@ -501,8 +529,8 @@ def project_agent_names(
 ) -> frozenset[str]:
     """Dispatchable agent names declared by a project, cached on a stat signature.
 
-    Only ``<project>/.kiro/agents/*.json`` contributes, because only those names are
-    ones kiro-cli can activate (see :func:`project_agent_files`).
+    Only ``<project>/.kiro/agents/`` (``*.json`` and ``*.md``) contributes, because
+    only those names are ones the backend can activate (see :func:`project_agent_files`).
 
     Cached per project directory and revalidated by :func:`_project_signature`, so a
     repeat call on an unchanged checkout costs a pair of ``scandir`` walks rather than
@@ -699,7 +727,7 @@ def agent_model_map(
     if not directory.is_dir():
         return {}
     try:
-        files = sorted(directory.glob("*.json"))
+        files = iter_agent_spec_files(directory)
     except OSError:
         return {}
 
@@ -865,7 +893,7 @@ def parsed_agent_specs(
     # and last-write-wins — the same rows, from the same signature-checked
     # directory state, so the duplicate work is bounded and harmless.
     try:
-        candidates = sorted(d.glob("*.json"))
+        candidates = iter_agent_spec_files(d)
     except OSError:
         candidates = []
     rows: list[tuple[dict[str, Any], Path]] = []
@@ -906,7 +934,8 @@ def agent_skill_globs(agent: str, agents_dir: Path | None = None) -> list[str]:
 def _dir_signature(d: Path) -> _ListAgentsSig:
     """Cheap stat-only signature of the agents dir.
 
-    Captures each JSON entry's name and mtime — enough to detect adds,
+    Captures each spec entry's name and mtime (both forms; a markdown edit
+    that went unfingerprinted would serve a stale roster forever) — enough to detect adds,
     removals, renames, and any edit that changes a file's mtime, without
     reading or parsing any file. An edit landing inside the same mtime tick
     is invisible here; :func:`clear_list_agents_cache` is the escape hatch
@@ -924,7 +953,7 @@ def _dir_signature(d: Path) -> _ListAgentsSig:
                 # ``Foo.JSON`` to ``glob("*.json")`` consumers, so a
                 # case-sensitive suffix here would omit from the signature a
                 # file the scans include — its edits would never invalidate.
-                if not entry.name.lower().endswith(".json"):
+                if not is_agent_spec_name(entry.name):
                     continue
                 try:
                     m = entry.stat().st_mtime_ns
@@ -1120,7 +1149,7 @@ def list_agents(
     if d.is_dir():
         user_candidates = 0
         user_parsed = 0
-        for f in sorted(d.glob("*.json")):
+        for f in iter_agent_spec_files(d):
             # AppleDouble sidecars are rejected by design, not by failure — a
             # directory holding only sidecars is empty of specs, not broken.
             if not f.name.startswith("._"):
