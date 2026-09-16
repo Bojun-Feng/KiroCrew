@@ -5,7 +5,7 @@ import React, { createContext, useContext, memo, useEffect, useMemo, useRef, use
 import Clickable from './Clickable'
 import { HOVER_NONE_ACTIONS_ROW_CLS } from '../utils/touchActions'
 import { getImageDims, rememberImageDims } from '../utils/imageDims'
-import { X, Download, MoreHorizontal, Plus, Minus, Search, Folder, Maximize2, Check, FileCode, FileSpreadsheet, Copy, Image as ImageIcon, ImageOff, GitPullRequest, MessageSquare, ExternalLink } from 'lucide-react'
+import { X, Download, Loader2, MoreHorizontal, Plus, Minus, Search, Folder, Maximize2, Check, FileCode, FileSpreadsheet, Copy, Image as ImageIcon, ImageOff, GitPullRequest, MessageSquare, ExternalLink } from 'lucide-react'
 import { copyCode, copyToClipboard } from '../utils/clipboard'
 import { capWhitespaceRuns, remarkBoundDepth, rehypeBoundRawDepth } from '../utils/markdownDepthBound'
 import { hastTableToCsv, hastTableToMarkdown } from '../utils/tableClipboard'
@@ -567,35 +567,56 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
   // Rendered SVG markup, kept for the enlarge viewer. Empty until a successful
   // render and reset on failure, so the enlarge affordance only ever exists
   // for (and targets) the diagram currently on screen.
-  const [svg, setSvg] = useState('')
+  const [{ svg, code: renderedCode }, setRendered] = useState({ svg: '', code: '' })
   const [enlarged, setEnlarged] = useState(false)
   const moreRef = useRef<HTMLButtonElement>(null)
   const enlargeAfterMenu = useRef(false)
   const [downloadFailed, setDownloadFailed] = useState(false)
   const [downloading, setDownloading] = useState(false)
   const downloadDiagram = async (format: 'svg' | 'png') => {
+    if (!svg || renderedCode !== code) return
     setDownloading(true)
+    let snapshotHost: HTMLDivElement | undefined
     try {
+      let basename = ref.current?.querySelector(':scope > svg > title')?.textContent?.normalize('NFKC')
+        .replace(/[^\p{L}\p{N}_-]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 80)
+      if (!basename || /^(con|prn|aux|nul|com[0-9]|lpt[0-9])$/i.test(basename)) basename = 'mermaid-diagram'
       let blob: Blob
       if (format === 'svg') {
         blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' })
       } else {
         const node = ref.current
         if (!node) throw new Error('diagram not mounted')
+        // Freeze pixels' inputs before any await; a rerender may replace the live SVG.
+        const snapshot = node.cloneNode(true) as HTMLDivElement
+        const originals = [node, ...node.querySelectorAll<HTMLElement | SVGElement>('*')]
+        const copies = [snapshot, ...snapshot.querySelectorAll<HTMLElement | SVGElement>('*')]
+        originals.forEach((element, index) => {
+          const style = getComputedStyle(element)
+          for (const property of Array.from(style)) copies[index].style.setProperty(property, style.getPropertyValue(property))
+        })
+        const backgroundColor = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()
+        snapshotHost = document.createElement('div')
+        Object.assign(snapshotHost.style, { position: 'absolute', left: '-100000px', top: '0', pointerEvents: 'none' })
+        snapshotHost.setAttribute('aria-hidden', 'true')
+        // Isolate SVG IDs/styles from Mermaid's next render, while retaining layout.
+        snapshotHost.attachShadow({ mode: 'closed' }).appendChild(snapshot)
+        document.body.appendChild(snapshotHost)
         const { toBlob } = await import('html-to-image')
-        const image = await toBlob(node, {
+        const image = await toBlob(snapshot, {
           pixelRatio: 2,
-          fontEmbedCSS: await mermaidFontCss(node),
-          backgroundColor: getComputedStyle(document.documentElement).getPropertyValue('--bg').trim(),
+          fontEmbedCSS: await mermaidFontCss(snapshot),
+          backgroundColor,
         })
         if (!image) throw new Error('canvas encoder returned null')
         blob = image
       }
-      downloadBlob(blob, `mermaid-diagram.${format}`)
+      downloadBlob(blob, `${basename}.${format}`)
       setDownloadFailed(false)
     } catch {
       setDownloadFailed(true)
     } finally {
+      snapshotHost?.remove()
       setDownloading(false)
     }
   }
@@ -736,7 +757,7 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
         range.selectNodeContents(ref.current)
         range.deleteContents()
         ref.current.appendChild(range.createContextualFragment(result.svg))
-        setSvg(result.svg)
+        setRendered({ svg: result.svg, code })
       })
       .catch(() => {
         if (!live || !ref.current) return
@@ -748,7 +769,7 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
         // one here left two spellings of the same thing, kept in sync by hand,
         // which diverges the first time either is retouched.
         ref.current.textContent = ''
-        setSvg('')
+        setRendered({ svg: '', code: '' })
         setEnlarged(false)
         // Reset so the failed state has ONE shape. Not to prevent stranding: the
         // source below now lives OUTSIDE the hidden host, so neither value of
@@ -826,7 +847,7 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
           toggle to. Copy rides with the SOURCE for a second reason: on the
           rendered diagram the object of "copy" is ambiguous -- the picture or the
           text behind it -- and beside the source text it is not. */}
-      <div className={`absolute top-1.5 right-1.5 flex items-center gap-1 transition-opacity ${showSource ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'} ${HOVER_NONE_ACTIONS_ROW_CLS}`}>
+      <div className={`absolute top-1.5 right-1.5 flex items-center gap-1 transition-opacity ${showSource || downloading ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'} ${HOVER_NONE_ACTIONS_ROW_CLS}`}>
         {svg && (
           <button
             data-testid="mermaid-source-toggle"
@@ -861,12 +882,20 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
               <button
                 type="button"
                 ref={moreRef}
+                aria-busy={downloading}
+                aria-disabled={downloading}
+                onPointerDown={event => { if (downloading) event.preventDefault() }}
+                onKeyDown={event => {
+                  if (downloading && ['Enter', ' ', 'ArrowDown'].includes(event.key)) event.preventDefault()
+                }}
                 data-testid="mermaid-more-actions"
                 aria-label={i18nT('components.markdownRenderer.diagram_actions')}
                 title={i18nT('components.markdownRenderer.diagram_actions')}
                 className={MERMAID_ACTION_BTN_CLS}
               >
-                <MoreHorizontal className="lucide-inline" aria-hidden="true" />
+                {downloading
+                  ? <Loader2 className="lucide-inline animate-spin motion-reduce:animate-none" aria-hidden="true" />
+                  : <MoreHorizontal className="lucide-inline" aria-hidden="true" />}
               </button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" onCloseAutoFocus={event => {
@@ -882,11 +911,11 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
                 <Maximize2 className="lucide-inline" aria-hidden="true" />
                 {i18nT('components.diagramLightbox.enlarge_diagram')}
               </DropdownMenuItem>
-              <DropdownMenuItem data-testid="mermaid-download-svg" disabled={downloading} onSelect={() => { void downloadDiagram('svg') }}>
+              <DropdownMenuItem data-testid="mermaid-download-svg" disabled={downloading || renderedCode !== code} onSelect={() => { void downloadDiagram('svg') }}>
                 <Download className="lucide-inline" aria-hidden="true" />
                 {i18nT('components.markdownRenderer.download_svg')}
               </DropdownMenuItem>
-              <DropdownMenuItem data-testid="mermaid-download-png" disabled={downloading} onSelect={() => { void downloadDiagram('png') }}>
+              <DropdownMenuItem data-testid="mermaid-download-png" disabled={downloading || renderedCode !== code} onSelect={() => { void downloadDiagram('png') }}>
                 <Download className="lucide-inline" aria-hidden="true" />
                 {i18nT('components.markdownRenderer.download_png')}
               </DropdownMenuItem>
@@ -4558,14 +4587,7 @@ async function downloadLightboxImage(image: LightboxImage): Promise<void> {
     const res = await fetch(image.src)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const blob = await res.blob()
-    const objUrl = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = objUrl
-    a.download = name
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    setTimeout(() => URL.revokeObjectURL(objUrl), 1000)
+    downloadBlob(blob, name)
   } catch {
     window.open(image.src, '_blank', 'noopener,noreferrer')
   }

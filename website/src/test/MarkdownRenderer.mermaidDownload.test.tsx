@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 
 vi.mock('mermaid', () => ({ default: { initialize: vi.fn(), render: vi.fn() } }))
 import userEvent from '@testing-library/user-event'
 vi.mock('html-to-image', () => ({ toBlob: vi.fn() }))
 import { toBlob } from 'html-to-image'
 import mermaid from 'mermaid'
+import * as mermaidFonts from '../components/mermaidFontCss'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 
 const PNG = new Blob(['png bytes'], { type: 'image/png' })
@@ -44,26 +45,81 @@ describe('Mermaid downloads', () => {
     ])
   })
 
-  it('downloads only the exact rendered SVG with its MIME and filename', async () => {
-    const { menu } = await openActions()
+  it.each([
+    ['', 'mermaid-diagram'],
+    ['Booking / Payment: final?', 'Booking-Payment-final'],
+    ['预订 流程', '预订-流程'],
+    ['.. / ..', 'mermaid-diagram'],
+    ['CON', 'mermaid-diagram'],
+  ])('downloads the exact SVG and PNG with a safe title basename (%s)', async (title, basename) => {
+    const rendered = svgFixture.cloneNode(true) as SVGSVGElement
+    if (title) rendered.appendChild(document.createElementNS('http://www.w3.org/2000/svg', 'title')).textContent = title
+    const renderedSvg = rendered.outerHTML
+    vi.mocked(mermaid.render).mockResolvedValue({ svg: renderedSvg } as never)
+    const { more, menu } = await openActions()
     await userEvent.click(within(menu).getByRole('menuitem', { name: 'Download SVG' }))
     expect(URL.createObjectURL).toHaveBeenCalledTimes(1)
     const blob = vi.mocked(URL.createObjectURL).mock.calls[0][0] as Blob
     expect(blob.type).toBe('image/svg+xml;charset=utf-8')
-    expect(await blob.text()).toBe(SVG)
+    expect(await blob.text()).toBe(renderedSvg)
     const anchor = vi.mocked(HTMLAnchorElement.prototype.click).mock.instances[0]
-    expect(anchor.download).toBe('mermaid-diagram.svg')
+    expect(anchor.download).toBe(`${basename}.svg`)
+    await userEvent.click(more)
+    await userEvent.click(await screen.findByRole('menuitem', { name: 'Download PNG' }))
+    await waitFor(() => expect(HTMLAnchorElement.prototype.click).toHaveBeenCalledTimes(2))
+    expect(vi.mocked(HTMLAnchorElement.prototype.click).mock.instances[1].download).toBe(`${basename}.png`)
   })
 
-  it('rasterizes the live diagram host at 2x only on demand and downloads PNG', async () => {
-    const { menu } = await openActions()
+  it('rasterizes the diagram snapshot at 2x only on demand and downloads PNG', async () => {
+    let finish!: (blob: Blob) => void
+    vi.mocked(toBlob).mockReturnValue(new Promise(resolve => { finish = resolve }))
+    const { toggle, more, menu } = await openActions()
     expect(toBlob).not.toHaveBeenCalled()
-    const host = document.querySelector('figure > div')
     await userEvent.click(within(menu).getByRole('menuitem', { name: 'Download PNG' }))
+    await waitFor(() => expect(toBlob).toHaveBeenCalled())
+    expect(more).toHaveAttribute('aria-busy', 'true')
+    expect(more).toHaveAttribute('aria-disabled', 'true')
+    await waitFor(() => expect(more).toHaveFocus())
+    await userEvent.click(more)
+    await userEvent.keyboard('{Enter} {ArrowDown}')
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(toBlob).toHaveBeenCalledTimes(1)
+    expect(toggle.parentElement!.querySelectorAll('button')).toHaveLength(2)
+    await act(async () => { finish(PNG) })
     await waitFor(() => expect(URL.createObjectURL).toHaveBeenCalledTimes(1))
-    expect(toBlob).toHaveBeenCalledWith(host, expect.objectContaining({ pixelRatio: 2 }))
+    expect(more).toHaveAttribute('aria-busy', 'false')
+    expect(more).toBeEnabled()
+    expect(toBlob).toHaveBeenCalledWith(expect.any(HTMLElement), expect.objectContaining({ pixelRatio: 2 }))
     expect(vi.mocked(URL.createObjectURL).mock.calls[0][0]).toBe(PNG)
     expect(vi.mocked(HTMLAnchorElement.prototype.click).mock.instances[0].download).toBe('mermaid-diagram.png')
+  })
+
+  it('keeps the exported snapshot unchanged when the diagram rerenders during PNG generation', async () => {
+    let finishFonts!: (css: string) => void
+    vi.spyOn(mermaidFonts, 'mermaidFontCss').mockReturnValue(new Promise(resolve => { finishFonts = resolve }))
+    const { rerender } = render(<MarkdownRenderer content={MARKDOWN} />)
+    await userEvent.click(await screen.findByTestId('mermaid-more-actions'))
+    await userEvent.click(await screen.findByRole('menuitem', { name: 'Download PNG' }))
+    await waitFor(() => expect(mermaidFonts.mermaidFontCss).toHaveBeenCalled())
+    const snapshot = vi.mocked(mermaidFonts.mermaidFontCss).mock.calls[0][0]
+    expect(snapshot.isConnected).toBe(true)
+
+    vi.mocked(mermaid.render).mockResolvedValue({ svg: SVG.replace('Rendered label', 'Updated label') } as never)
+    rerender(<MarkdownRenderer content={'```mermaid\ngraph TD;C-->D\n```'} />)
+    await waitFor(() => expect(document.querySelector('figure > div')).toHaveTextContent('Updated label'))
+    expect(snapshot).toHaveTextContent('Rendered label')
+    expect(snapshot).not.toHaveTextContent('Updated label')
+
+    await act(async () => { finishFonts('') })
+    await waitFor(() => expect(URL.createObjectURL).toHaveBeenCalledTimes(1))
+    expect(toBlob).toHaveBeenCalledWith(snapshot, expect.objectContaining({ pixelRatio: 2 }))
+    expect(snapshot.isConnected).toBe(false)
+
+    vi.mocked(mermaid.render).mockReturnValue(new Promise(() => {}))
+    rerender(<MarkdownRenderer content={'```mermaid\ngraph TD;E-->F\n```'} />)
+    await userEvent.click(screen.getByTestId('mermaid-more-actions'))
+    expect(await screen.findByRole('menuitem', { name: 'Download SVG' })).toHaveAttribute('aria-disabled', 'true')
+    expect(screen.getByRole('menuitem', { name: 'Download PNG' })).toHaveAttribute('aria-disabled', 'true')
   })
 
   it('reports a rejected rasterization and clears the notice only after a successful retry', async () => {

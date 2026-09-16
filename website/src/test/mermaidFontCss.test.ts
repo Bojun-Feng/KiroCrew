@@ -37,3 +37,27 @@ it('embeds fonts from a cross-origin stylesheet when CSSOM access is denied', as
     'https://fonts.example.test/style.css', 'https://fonts.example.test/font.woff2',
   ])
 })
+
+it('keeps readable fonts when other stylesheets or font assets are unavailable', async () => {
+  const blocked = (href?: string) => ({ href, get cssRules(): CSSRuleList { throw new DOMException('Cross-origin', 'SecurityError') } })
+  const faces = ['denied.woff2', 'offline.woff2', 'readable.woff2'].map(file => ({
+    type: CSSRule.FONT_FACE_RULE,
+    style: { getPropertyValue: () => 'DiagramFont' },
+    cssText: `@font-face { font-family: DiagramFont; src: url("${file}"); }`,
+  }))
+  vi.spyOn(document, 'styleSheets', 'get').mockReturnValue([
+    blocked(), blocked('https://fonts.example.test/offline.css'), blocked('https://fonts.example.test/denied.css'),
+    { href: 'https://fonts.example.test/style.css', cssRules: faces },
+  ] as unknown as StyleSheetList)
+  vi.spyOn(window, 'getComputedStyle').mockReturnValue({ fontFamily: 'DiagramFont' } as CSSStyleDeclaration)
+  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+    if (url.includes('offline')) throw new TypeError('Failed to fetch')
+    if (url.includes('denied')) return { ok: false }
+    return { ok: true, blob: async () => new Blob(['font'], { type: 'font/woff2' }) }
+  }))
+  const css = await mermaidFontCss(document.createElement('div'))
+  expect(css).toContain('data:font/woff2;base64,')
+  expect(css).not.toMatch(/url\(["']?(?!data:)[^"')]+["']?\)/)
+  expect(css).not.toContain('denied')
+  expect(css).not.toContain('offline')
+})
