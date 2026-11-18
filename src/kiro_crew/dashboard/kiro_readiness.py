@@ -19,8 +19,9 @@ latched value can be arbitrarily stale. That splits the callers in two:
   readiness-gated". The reruns and ``POST /v1/chat/completions`` block only
   while their turn runs on a harness that signs in via kiro-cli
   (:func:`rerun_signs_in_via_kiro_cli`). The callers that only start a session
-  turn are also authorized by Crew's own sign-in when that turn runs on the KAS
-  engine bundle, which needs no kiro-cli (:func:`kas_crew_signin_ready`).
+  turn are also authorized by Crew's own sign-in when that turn runs on KAS
+  without kiro-cli's sign-in: the engine bundle, or kiro-cli's relay entered
+  past its launcher on Crew's sign-in (:func:`kas_crew_signin_ready`).
 """
 
 from __future__ import annotations
@@ -167,14 +168,15 @@ async def kiro_verified_ready(
 
 
 def _kas_bundle_turn_sync(session_key: str | None, config: object = None) -> bool:
-    """True when the turn on *session_key* runs on Crew's own installed KAS engine bundle.
+    """True when the turn on *session_key* runs on KAS on Crew's own sign-in alone.
 
-    That route spawns no kiro-cli at all (``acp/harness/kas.py``
-    ``KasHarness.resolve_spawn``): the engine is the bundle's Node build and its
-    credential is Crew's own sign-in, never kiro-cli's store. The harness takes
-    that route when it is KAS and either ``agent.kas_bundle`` is on or kiro-cli's
-    relay cannot run here, so the conditions are the same three, read per
-    session:
+    That is Crew's own installed KAS engine bundle, or kiro-cli's relay when
+    Crew's sign-in starts it. The bundle spawns no kiro-cli at all
+    (``acp/harness/kas.py`` ``KasHarness.resolve_spawn``): the engine is the
+    bundle's Node build and its credential is Crew's own sign-in, never
+    kiro-cli's store. The harness takes that route when it is KAS and either
+    ``agent.kas_bundle`` is on or kiro-cli's relay cannot run here, so the
+    conditions are the same three, read per session:
 
     * the session's own backend is KAS, through ``select_provider_backend``, the
       gate the provider factory uses, with the same inputs: the harness the
@@ -195,7 +197,15 @@ def _kas_bundle_turn_sync(session_key: str | None, config: object = None) -> boo
       which the provider factory hands to the spawn;
     * an engine is installed, since a bundle spawn with nothing installed refuses.
 
-    Blocking (config reads and a stat of the engine record); never raises.
+    Off the bundle, the relay qualifies when a usable vault identity starts it
+    past kiro-cli's launcher (``kas_bundle.crew_sign_in_starts_spawn``, judged on
+    the same Bot pin): the harness then enters through the chat binary, which
+    skips the launcher's own sign-in check, and answers the engine's credential
+    callback from the vault. A relay entered through the launcher still needs
+    kiro-cli's sign-in, so it keeps the kiro-cli gate.
+
+    Blocking (config, vault and kiro-cli reads and a stat of the engine record);
+    never raises.
     """
     try:
         from kiro_crew.agent_sdk import kas_bundle
@@ -218,14 +228,13 @@ def _kas_bundle_turn_sync(session_key: str | None, config: object = None) -> boo
             # rule 2 judged on the session's own Bot pin as the spawn judges it.
             # The pin comes from the applied config, as the provider factory hands
             # it to the spawn; only the flag is read off disk.
-            if not kas_bundle.kas_spawn_takes_bundle(
-                on_disk.agent, route_pin(config, session_key, pick)
-            ):
-                return False
+            pin = route_pin(config, session_key, pick)
+            if not kas_bundle.kas_spawn_takes_bundle(on_disk.agent, pin):
+                return kas_bundle.crew_sign_in_starts_spawn(pin)
             return kas_bundle.installed_bundle() is not None  # type: ignore[misc]
         return False
     except Exception as exc:  # noqa: BLE001 - an unreadable answer keeps the kiro-cli gate
-        logger.debug("Kiro readiness: KAS bundle route probe failed (%s)", type(exc).__name__)
+        logger.debug("Kiro readiness: KAS route probe failed (%s)", type(exc).__name__)
         return False
 
 
@@ -252,17 +261,21 @@ def turn_gate_target(state: object, slot_key: object) -> tuple[bool, str | None]
 
 
 def live_turn_route(state: object, session_key: str | None) -> bool | None:
-    """Whether the LIVE session on *session_key* is Crew's KAS engine bundle.
+    """Whether the LIVE session on *session_key* is Crew's KAS engine bundle, or ``None``.
 
     A session that already has a provider runs its next turn on that provider:
     ``SessionManager.get_or_create`` reuses it with no backend check, and
     changing ``agent.acp_backend`` retires only the background runtime. So the
     configured backend does not name the route of a live session's turn; the
     running process does, and this reads it from the spawn plan it recorded
-    (``AcpRuntime._kas_engine_bundle``).
+    (``AcpRuntime._kas_engine_bundle`` and ``AcpRuntime._kas_host_auth``).
 
     * ``None``: no live session (no session map, no key, no provider). The turn
-      cold-starts, and the configured selection decides its route.
+      cold-starts, and the configured selection decides its route. Also a live
+      KAS relay spawned with Crew as its auth owner: it answers the engine's
+      credential callback from Crew's vault, but it may have been entered
+      through kiro-cli's launcher, and a respawn takes the configured route, so
+      that route decides too.
     * ``True``: the live process is the engine bundle, so its turn spawns no
       kiro-cli.
     * ``False``: a live session on any other route, or one whose route cannot be
@@ -291,7 +304,11 @@ def live_turn_route(state: object, session_key: str | None) -> bool | None:
             inner = getattr(provider, "client", None)
         runtime = getattr(inner, "_runtime", None)
         on_kas = getattr(runtime, "acp_backend", None) == ACP_BACKEND_KAS
-        return on_kas and getattr(runtime, "_kas_engine_bundle", False) is True
+        if on_kas and getattr(runtime, "_kas_engine_bundle", False) is True:
+            return True
+        if on_kas and getattr(runtime, "_kas_host_auth", False) is True:
+            return None
+        return False
     except Exception as exc:  # noqa: BLE001 - an unreadable live session keeps the gate
         logger.debug("Kiro readiness: live session route unreadable (%s)", type(exc).__name__)
         return False
@@ -303,15 +320,17 @@ async def kas_crew_signin_ready(
     """True when the turn on *session_key* needs no kiro-cli and Crew's sign-in can serve it.
 
     *live_route* is :func:`live_turn_route` for that session. A live session is
-    judged by the process it is running, never by the configuration: ``False``
-    refuses the bypass, ``True`` skips the configured-route check. Only ``None``
-    (a cold start) reads the configured selection, from *config* (the session
-    manager's applied configuration) when given.
+    judged by the process it is running: ``False`` refuses the bypass, ``True``
+    skips the configured-route check. Only ``None``
+    (a cold start, or a live relay Crew's vault signs in) reads the configured
+    selection, from *config* (the session manager's applied configuration) when
+    given.
 
     The turn-starting gate's counterpart of :func:`kiro_verified_ready` for a
-    session that runs on the KAS engine bundle. There the kiro-cli probe answers
-    a question the turn never asks (on a host with no kiro-cli it is never
-    ready), so the authority is what the engine will ask Crew for:
+    session that runs on the KAS engine bundle, or on kiro-cli's relay started on
+    Crew's sign-in. There the kiro-cli probe answers a question the turn never
+    asks (on a host with no kiro-cli it is never ready), so the authority is what
+    the engine will ask Crew for:
     :class:`~kiro_crew.auth.provider.KasAuthProvider` resolves it from the vault
     and refreshes it under the identity's lock, the same call that answers the
     engine's ``_kiro/auth/getAccessToken``. A rejected or unattemptable refresh,
@@ -561,8 +580,9 @@ async def reject_if_kiro_unverified(
     *session_key* names the session that turn runs on (``None`` for a slot that
     does not exist yet). Such a caller is also authorized by
     :func:`kas_crew_signin_ready`: when that session runs on the KAS engine
-    bundle, its turn spawns no kiro-cli and is served by Crew's sign-in, so the
-    kiro-cli probe is not its authority. It is checked
+    bundle, or on kiro-cli's relay started on Crew's sign-in, its turn needs no
+    kiro-cli sign-in and is served by Crew's, so the kiro-cli probe is not its
+    authority. It is checked
     first because it reads only local state unless the vault token needs a
     refresh, and it spares a host that never runs kiro-cli the probe. A caller
     that spawns kiro-cli itself (the ``/api/models`` catalog off the bundle
@@ -570,7 +590,8 @@ async def reject_if_kiro_unverified(
 
     *turn_reuses_session* says whether that turn runs on the session's live
     provider. Regenerate and ``/v1/chat/completions`` reuse it, so a live
-    session is judged by its own running process (:func:`live_turn_route`).
+    session is judged by its own running process (:func:`live_turn_route`), or,
+    for a relay Crew's vault signs in, by the configured route a respawn takes.
     Edit-resend and rewind discard the conversation before their turn, so the
     turn cold-starts from the current configuration; they pass False and are
     judged on the configured route.
@@ -579,8 +600,8 @@ async def reject_if_kiro_unverified(
     process: a rewind with sub-agents attached swaps the conversation on it
     (``swap_conversation``), and which path runs is decided later, under the
     slot lock. Both routes must then serve the turn, so a live process not on
-    the bundle keeps the kiro-cli gate, and otherwise the configured route is
-    judged.
+    the bundle keeps the kiro-cli gate unless it is a relay Crew's vault signs
+    in, and otherwise the configured route is judged.
     """
 
     state = request.app.get("state")

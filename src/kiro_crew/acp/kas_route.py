@@ -470,6 +470,7 @@ def crew_sign_in_starts_spawn(
     *,
     environ: Mapping[str, str] | None = None,
     home: Path | None = None,
+    pin: str = "",
 ) -> bool:
     """Whether the next KAS spawn starts on Kiro Crew's own usable sign-in alone.
 
@@ -478,7 +479,9 @@ def crew_sign_in_starts_spawn(
     spawn passes that check, so it needs kiro-cli's sign-in too. The vault
     entry must resolve (``lts_sign_in.resolve``): a lapsed one answers False,
     where ``auth.bridge.vault_holds_identity`` still names the spawn
-    Crew-owned. Blocking (vault, kiro-cli store and config reads); never raises.
+    Crew-owned. *pin* is the session's own Bot pin, judged by rule 2 as
+    :func:`resolve_kas_route` judges it; ``""`` asks about the installation.
+    Blocking (vault, kiro-cli store and config reads); never raises.
     """
     environ = os.environ if environ is None else environ
     home = Path.home() if home is None else home
@@ -491,7 +494,7 @@ def crew_sign_in_starts_spawn(
         kiro_bin = _resolve_kiro_bin(environ=environ, home=home)
         if kiro_bin and crew_entry_skips_launcher(kiro_bin, environ):
             return True
-        return resolve_kas_route(environ=environ, home=home).bundle
+        return resolve_kas_route(environ=environ, home=home, pin=pin).bundle
     except Exception:  # noqa: BLE001 - no usable Crew sign-in keeps kiro-cli's in play
         return False
 

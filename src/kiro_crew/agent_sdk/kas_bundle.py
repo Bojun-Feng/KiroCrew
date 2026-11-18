@@ -278,15 +278,16 @@ def route_chosen_by_sharing_preview(route: Any) -> bool:
     )
 
 
-def crew_sign_in_starts_spawn() -> bool:
+def crew_sign_in_starts_spawn(pin: str = "") -> bool:
     """Whether the next KAS spawn starts on Kiro Crew's usable sign-in alone.
 
-    ``acp.kas_route.crew_sign_in_starts_spawn``, for the dashboard. Blocking
-    (vault, config and kiro-cli reads); never raises.
+    ``acp.kas_route.crew_sign_in_starts_spawn``, for the dashboard. *pin* is the
+    session's own Bot pin, as :func:`kas_route` takes it. Blocking (vault, config
+    and kiro-cli reads); never raises.
     """
     from kiro_crew.acp.kas_route import crew_sign_in_starts_spawn as starts
 
-    return starts()
+    return starts(pin=pin)
 
 
 def relay_runs_on_kiro_cli_sign_in() -> bool:

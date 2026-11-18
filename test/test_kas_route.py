@@ -391,6 +391,22 @@ class TestCrewSignInStartsSpawn:
         monkeypatch.setattr("kiro_crew.acp.client._resolve_kiro_bin", lambda **k: None)
         assert kas_route.crew_sign_in_starts_spawn(environ={}, home=tmp_path) is True
 
+    def test_the_route_is_judged_on_the_sessions_own_pin(self, tmp_path, monkeypatch, vault):
+        """A session pinned to Kiro CLI stays on the launcher relay (rule 2), not the bundle."""
+        seen: dict = {}
+
+        def route(**kwargs):
+            seen.update(kwargs)
+            return kas_route.RELAY
+
+        monkeypatch.setattr(kas_route, "resolve_kas_route", route)
+        monkeypatch.setattr("kiro_crew.acp.client._resolve_kiro_bin", lambda **k: None)
+        # Through the dashboard's wrapper, which the readiness gate calls.
+        from kiro_crew.agent_sdk import kas_bundle as sdk_kas_bundle
+
+        assert sdk_kas_bundle.crew_sign_in_starts_spawn("kiro") is False
+        assert seen["pin"] == "kiro"
+
     def test_no_usable_crew_sign_in_does_not(self, tmp_path, monkeypatch):
         def _lapsed(**kwargs):
             raise lts_sign_in.SignInError(

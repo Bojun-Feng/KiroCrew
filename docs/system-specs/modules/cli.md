@@ -1055,9 +1055,10 @@ dashboard does not guide the user to sign in"). Only the endpoints that act
 BEFORE a turn still return 503: the poll-driven `kiro-cli` spawn sites
 (`/api/models`, `/api/sessions/usage`) and the destructive reruns (regenerate,
 edit-resend, rewind) on a harness that signs in through kiro-cli, which rewrite
-persisted history up front. On the KAS engine bundle route the reruns and
-`/v1/chat/completions` accept Crew's own sign-in instead of a ready `kiro-cli`,
-since their turn needs no `kiro-cli`.
+persisted history up front. On the KAS engine bundle route, and on kiro-cli's
+relay started on Crew's sign-in alone, the reruns and `/v1/chat/completions`
+accept Crew's own sign-in instead of a ready `kiro-cli`, since their turn needs
+no `kiro-cli` sign-in.
 
 ### Custom Domain
 

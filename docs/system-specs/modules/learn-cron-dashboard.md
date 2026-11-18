@@ -2599,30 +2599,39 @@ specified compatibility change.
   reuses it with no backend check and an `agent.acp_backend` change retires
   only the background runtime: `live_turn_route` reads the spawn plan the
   runtime recorded (`SpawnPlan.engine_bundle`, set only by the KAS harness's
-  bundle route, read through the `AcpProvider` wrapper's `client`), and any
-  live session not on the bundle, or whose route cannot be read, keeps the
-  `kiro-cli` gate. A retained provider whose process has exited is not
-  liveness-checked here (that would add a runtime pid reader the pid-reader
-  ratchet refuses); its recorded route still answers, and an ordinary send,
+  bundle route, read through the `AcpProvider` wrapper's `client`). A live KAS
+  relay whose engine credential Crew's vault answers (`SpawnPlan.host_auth`) is
+  judged on the configured route instead: it may have been entered through
+  kiro-cli's launcher, and a respawn takes that route. Any other live session,
+  or one whose route cannot be read, keeps the `kiro-cli` gate. A retained
+  provider whose process has exited is not liveness-checked here (that would
+  add a runtime pid reader the pid-reader ratchet refuses); its recorded route
+  still answers, and an ordinary send,
   which is ungated, evicts it. A caller that discards the conversation before its turn
   (edit-resend, rewind) passes `turn_reuses_session=False`: its turn
   cold-starts, so the live process is not read. A rewind also passes
   `may_keep_live_process=True`: with sub-agents attached it swaps the
   conversation on the live process (`swap_conversation`) instead of
-  discarding it, so a live process not on the bundle keeps the `kiro-cli`
-  gate, and otherwise the configured route is judged. A cold start reads the
+  discarding it, so a live process that is neither the bundle nor a relay
+  Crew's vault signs in keeps the `kiro-cli` gate, and otherwise the
+  configured route is judged. A cold start reads the
   configuration: the session resolves to KAS through
   `select_provider_backend` (a member thread runs on
   `agent.member_acp_backend`, so the default backend alone does not decide)
   and the KAS harness would take the bundle route (`agent.kas_bundle` on, or
   `kas_bundle.kas_route()` switching to the bundle because kiro-cli's relay
   cannot run here, `kas_bundle.kas_spawn_takes_bundle`) with an engine
-  installed. The automatic switch is judged on the session's own crewmate pin
+  installed, or it would take kiro-cli's relay started on Crew's sign-in alone
+  (`kas_bundle.crew_sign_in_starts_spawn`: a usable vault identity and an entry
+  past the launcher's own sign-in check, `kas_route.crew_entry_skips_launcher`;
+  a relay entered through the launcher keeps the gate). The automatic
+  switch is judged on the session's own crewmate pin
   (`crewmate_harness.route_pin`, passed through `kas_spawn_takes_bundle(agent,
-  pin)` to `resolve_kas_route(pin=...)`), as `KasHarness.resolve_spawn` judges
-  `kas_route` rule 2. Either way `KasAuthProvider.current()` must yield a credential
+  pin)` and `crew_sign_in_starts_spawn(pin)` to `resolve_kas_route(pin=...)`), as
+  `KasHarness.resolve_spawn` judges `kas_route` rule 2. Either way
+  `KasAuthProvider.current()` must yield a credential
   from Crew's sign-in (resolved and, when needed, refreshed; no identity or a
-  refused refresh is not ready). That turn spawns no `kiro-cli`. The `kiro-cli`
+  refused refresh is not ready). That turn needs no `kiro-cli` sign-in. The `kiro-cli`
   spawn sites leave `harness_turn` False. `turn_gate_target` names the session
   from the target slot (`None` for a slot not created yet); a slot it cannot
   read leaves `harness_turn` False, so the `kiro-cli` gate decides.
@@ -5777,16 +5786,17 @@ the setup notice instead of a turn that cannot run. All three therefore call
 through kiro-cli (the scoping is above), returning the shared
 `kiro_prerequisite_required` 503 (`kiro_probe_timed_out` when the latest probe
 timed out).
-When the slot's session runs on the KAS engine bundle and Crew's sign-in
-yields a credential, the gate passes without consulting `kiro-cli`
-(`harness_turn=True`, `kas_crew_signin_ready()`), because that turn runs and
-authenticates with no `kiro-cli` involved. Regenerate reuses the live session,
+When the slot's session runs on the KAS engine bundle, or on kiro-cli's relay
+started on Crew's sign-in, and Crew's sign-in yields a credential, the gate
+passes without consulting `kiro-cli`'s sign-in
+(`harness_turn=True`, `kas_crew_signin_ready()`), because that turn
+authenticates with Crew's sign-in alone. Regenerate reuses the live session,
 so its gate judges that running process (`live_turn_route`); edit-resend and
 rewind discard the conversation before their turn, so theirs
 (`turn_reuses_session=False`) judges the configured cold-start route. A rewind
 with sub-agents attached swaps the conversation on the live process instead, so
-it also keeps the `kiro-cli` gate when that process is not the bundle
-(`may_keep_live_process=True`).
+it also keeps the `kiro-cli` gate when that process is neither the bundle nor a
+relay Crew's vault signs in (`may_keep_live_process=True`).
 (`switch-variant` is exempt — it swaps an already-stored variant and starts no
 turn.)
 
